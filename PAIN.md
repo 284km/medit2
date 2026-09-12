@@ -137,10 +137,21 @@ What is left in `shim/medit2_shim.c` is `term_editor_output`: `ICRNL` and
 `OPOST`, which are this editor's choices about what Enter means and who writes
 the carriage return — not something raw mode should decide for everyone.
 
-## P6 🟢 No display width anywhere, and the line-break table cannot supply it (upstream, mere v0.1.476)
+## P6 🟢 The display width that existed was not accurate enough, and the line-break table could not supply a better one (upstream, mere v0.1.476)
 
 A terminal cursor moves by columns and a Japanese character is two of them. Get
 this wrong and every line containing one is drawn in the wrong place.
+
+**This entry said "no display width anywhere" and that was wrong.** `utf8_width`
+has been in the prelude since v0.1.45 and is in the stdlib reference; the search
+that missed it looked in `contrib/` and in the builtin matrix and never in the
+prelude. Measuring the two settled whether the new one was worth having: over
+17,661 code points they disagree on **2,083 (11.8%)** — 1,488 combining marks,
+format characters and conjoining jamo that `utf8_width`'s single U+0300..036F
+range misses (`U+200B ZERO WIDTH SPACE` among them), 380 narrow characters its
+coarse CJK block calls wide, and 209 wide characters and emoji outside its two
+hardcoded emoji blocks. Fine for lining up a table column, not fine for putting
+a cursor where a glyph ends.
 
 `contrib/unicode/lb_table.mere`'s generator already reads `EastAsianWidth.txt`
 — and keeps one bit, `flag_eastasian`, set for `F`, `W` and `H` together,
