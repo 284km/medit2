@@ -1,0 +1,213 @@
+// src/buffer.mere — the piece table.
+//
+// The document is never held in memory. A `buf` is a list of pieces, each one
+// naming a stretch of either the file on disk or the append-only `add` string
+// this session has typed. Opening a 3 GB file allocates one piece.
+//
+// WHY A LIST AND NOT A VEC. Two reasons, and the second is the better one.
+// `vec` has no insert-at or remove-at (medit's PAIN #1, still true two months
+// later), and an edit is exactly an insert-at in the middle. But a persistent
+// list also makes undo free: a snapshot is one cons cell, because the old and
+// new piece lists share every piece they have in common. The undo stack costs
+// one cons per edit no matter how large the file is. medit found that for lines
+// of text; it is far stronger here, where a piece list has one entry per edit
+// rather than one per line.
+//
+// Nothing in this file does I/O when the origin is `Mem`, which is what
+// --selftest runs on. `Disk` is the real thing. Both answer the same question --
+// give me bytes [off, off+len) of the original -- so every edit operation below
+// is tested against the pure one and used against the real one.
+
+// The source of the ORIGINAL text. Typed text never lives here: it is the
+// buf's own `add` string. `Disk` carries the length because `file_size` takes a
+// path and a handle cannot be asked.
+type origin = Mem of str | Disk of (File * int);
+
+// `from_add` is a bool rather than a second variant because a piece is compared
+// and split far more often than it is read.
+type piece = { from_add: bool, off: int, len: int };
+
+// The undo stack: (pieces, add) before each edit. `add` is restored too, so
+// undoing an insert leaves no piece pointing at the typed text.
+type hist = Empty | Snap of (piece list * str * hist);
+
+type buf = {
+  pieces: piece list,   // document order
+  add: str,             // append-only; pieces point into it
+  origin: origin,
+  hist: hist,
+};
+
+module Buffer {
+
+  let origin_len = fn (o: origin) ->
+    match o with
+    | Mem s -> str_len s
+    | Disk (_, n) -> n;
+
+  // Bytes [off, off+len) of the original. On Disk this is one fread through
+  // file_pread_bytes (v0.1.475) -- the whole reason this design is affordable.
+  // file_pread boxes every byte into an int and builds the Vec one fgetc at a
+  // time: ten times slower and five times the memory for the same page.
+  let origin_slice = fn (o: origin) -> fn (off: int) -> fn (len: int) ->
+    if len <= 0 then ""
+    else
+      match o with
+      | Mem s ->
+        let n = str_len s in
+        let start = if off < 0 then 0 else if off > n then n else off in
+        let stop = if start + len > n then n else start + len in
+        substring s start stop
+      | Disk (f, _) -> str_of_bytes (file_pread_bytes f off len);
+
+  let of_origin = fn (o: origin) ->
+    let n = origin_len o in
+    let whole = if n <= 0 then Nil
+                else Cons ((piece { from_add = false, off = 0, len = n } : piece), Nil) in
+    (buf { pieces = whole, add = "", origin = o, hist = Empty } : buf);
+
+  let of_str = fn (s: str) -> of_origin (Mem s);
+
+  // --- measurements --------------------------------------------------------
+  let rec _sum = fn (ps: piece list) -> fn (acc: int) ->
+    match ps with
+    | Nil -> acc
+    | Cons (p, rest) -> _sum rest (acc + p.len);
+
+  let len = fn (b: buf) -> _sum b.pieces 0;
+
+  let rec _count = fn (ps: piece list) -> fn (acc: int) ->
+    match ps with
+    | Nil -> acc
+    | Cons (_, rest) -> _count rest (acc + 1);
+
+  // How many pieces the table is carrying. Not for the editor -- for the
+  // tests, which assert that typing a word makes one piece and not one per key.
+  let piece_count = fn (b: buf) -> _count b.pieces 0;
+
+  // --- reading -------------------------------------------------------------
+  let _piece_text = fn (b: buf) -> fn (p: piece) ->
+    if p.from_add then substring b.add p.off (p.off + p.len)
+    else origin_slice b.origin p.off p.len;
+
+  // Bytes [from, from+want) of the DOCUMENT, walking only the pieces that
+  // overlap it. This is what the renderer calls: one screen, not one file.
+  let rec _slice = fn (b: buf) -> fn (ps: piece list) -> fn (pos: int) ->
+                   fn (from: int) -> fn (want: int) -> fn (acc: str) ->
+    if want <= 0 then acc
+    else
+      match ps with
+      | Nil -> acc
+      | Cons (p, rest) ->
+        let pend = pos + p.len in
+        if pend <= from then _slice b rest pend from want acc
+        else
+          let skip = if from > pos then from - pos else 0 in
+          let avail = p.len - skip in
+          let take = if avail > want then want else avail in
+          let sub = (piece { from_add = p.from_add, off = p.off + skip, len = take } : piece) in
+          _slice b rest pend (from + take) (want - take) (acc ++ _piece_text b sub);
+
+  let slice = fn (b: buf) -> fn (from: int) -> fn (want: int) ->
+    if want <= 0 then ""
+    else _slice b b.pieces 0 (if from < 0 then 0 else from) want "";
+
+  // The whole document. Only --selftest and small files should call this; the
+  // editor renders through `slice` so it never materialises more than a screen.
+  let text = fn (b: buf) -> slice b 0 (len b);
+
+  // --- splitting -----------------------------------------------------------
+  // Every edit is "split the list at a document offset, then rebuild".
+  // Splitting is the only place that reasons about offsets inside a piece,
+  // which is why insert and delete below are short.
+  //
+  // Returns (before_reversed, after). Reversed because the walk conses and the
+  // caller is about to cons more onto the front anyway.
+  let rec _split_rev = fn (ps: piece list) -> fn (pos: int) -> fn (at: int) ->
+                       fn (before: piece list) ->
+    match ps with
+    | Nil -> (before, Nil)
+    | Cons (p, rest) ->
+      let pend = pos + p.len in
+      if at >= pend then _split_rev rest pend at (Cons (p, before))
+      else if at <= pos then (before, ps)
+      else
+        let cut = at - pos in
+        let left = (piece { from_add = p.from_add, off = p.off, len = cut } : piece) in
+        let right = (piece { from_add = p.from_add, off = p.off + cut, len = p.len - cut } : piece) in
+        (Cons (left, before), Cons (right, rest));
+
+  // Two pieces that were adjacent in their source are one piece. Without this,
+  // typing N characters makes N pieces and every later split walks them all.
+  let _fuse = fn (a: piece) -> fn (b: piece) ->
+    if a.from_add == b.from_add then
+      if a.off + a.len == b.off
+      then Some (piece { from_add = a.from_add, off = a.off, len = a.len + b.len } : piece)
+      else None
+    else None;
+
+  let _cons_fused = fn (p: piece) -> fn (rest: piece list) ->
+    if p.len <= 0 then rest
+    else
+      match rest with
+      | Nil -> Cons (p, Nil)
+      | Cons (q, tail) ->
+        match _fuse p q with
+        | Some merged -> Cons (merged, tail)
+        | None -> Cons (p, rest);
+
+  // Rebuild the reversed `before` onto `after`, fusing at every join.
+  let rec _rebuild = fn (before: piece list) -> fn (after: piece list) ->
+    match before with
+    | Nil -> after
+    | Cons (p, rest) -> _rebuild rest (_cons_fused p after);
+
+  // --- editing -------------------------------------------------------------
+  let insert = fn (b: buf) -> fn (at: int) -> fn (s: str) ->
+    if str_eq s "" then b
+    else
+      let n = len b in
+      let at = if at < 0 then 0 else if at > n then n else at in
+      let parts = _split_rev b.pieces 0 at Nil in
+      let before = fst parts in
+      let after = snd parts in
+      let p = (piece { from_add = true, off = str_len b.add, len = str_len s } : piece) in
+      ({ b | pieces = _rebuild before (_cons_fused p after),
+             add = b.add ++ s,
+             hist = Snap ((b.pieces, b.add, b.hist)) } : buf);
+
+  // Drop `count` bytes off the front of a piece list.
+  let rec _drop = fn (ps: piece list) -> fn (count: int) ->
+    if count <= 0 then ps
+    else
+      match ps with
+      | Nil -> Nil
+      | Cons (p, rest) ->
+        if p.len <= count then _drop rest (count - p.len)
+        else Cons ((piece { from_add = p.from_add, off = p.off + count, len = p.len - count } : piece), rest);
+
+  let delete = fn (b: buf) -> fn (at: int) -> fn (count: int) ->
+    if count <= 0 then b
+    else
+      let n = len b in
+      let at = if at < 0 then 0 else if at > n then n else at in
+      let count = if at + count > n then n - at else count in
+      if count <= 0 then b
+      else
+        let parts = _split_rev b.pieces 0 at Nil in
+        let before = fst parts in
+        let after = _drop (snd parts) count in
+        ({ b | pieces = _rebuild before after,
+               hist = Snap ((b.pieces, b.add, b.hist)) } : buf);
+
+  // Undo is one cons off the stack.
+  let undo = fn (b: buf) ->
+    match b.hist with
+    | Empty -> b
+    | Snap (ps, ad, rest) -> ({ b | pieces = ps, add = ad, hist = rest } : buf);
+
+  let can_undo = fn (b: buf) ->
+    match b.hist with
+    | Empty -> false
+    | Snap (_, _, _) -> true;
+}

@@ -1,0 +1,147 @@
+// test/buffer_test.mere — the piece table, checked two ways.
+//
+// Every case runs against BOTH origins: `Mem` (a string, no I/O) and `Disk` (a
+// real file read through file_pread_bytes). They must agree. That is the point
+// of the pair: the pure one is easy to believe and the real one is the one that
+// ships, and a difference between them is exactly the bug this design could
+// have.
+//
+// Run: mere test/buffer_test.mere     (interpreter)
+//      mere -c test/buffer_test.mere > t.c && clang -O2 t.c -o t && ./t
+
+import "../src/buffer.mere";
+
+let fails = vec_new ();
+
+let check = fn (name: str) -> fn (got: str) -> fn (want: str) ->
+  if str_eq got want then ()
+  else vec_push fails (name ++ ": got [" ++ got ++ "] want [" ++ want ++ "]");
+
+let check_int = fn (name: str) -> fn (got: int) -> fn (want: int) ->
+  if got == want then ()
+  else vec_push fails (name ++ ": got " ++ show got ++ " want " ++ show want);
+
+// --- the two origins ------------------------------------------------------
+let seed = "the quick brown fox";
+let tmp = "/tmp/medit2_buffer_test.txt";
+let _ = write_file tmp seed;
+let fh = file_openrw tmp;
+
+let mem = Buffer.of_str seed;
+let disk = Buffer.of_origin (Disk ((fh, str_len seed)));
+
+// Runs one scenario on both origins and checks they agree with each other AND
+// with the expected string. Three-way, so an error that happens to corrupt both
+// the same way still shows.
+let both = fn (name: str) -> fn (f: buf -> buf) -> fn (want: str) ->
+  let m = Buffer.text (f mem) in
+  let d = Buffer.text (f disk) in
+  let _ = check (name ++ " (mem)") m want in
+  let _ = check (name ++ " (disk)") d want in
+  check (name ++ " (agree)") m d;
+
+// --- reading --------------------------------------------------------------
+let _ = check "text of untouched" (Buffer.text mem) seed;
+let _ = check "text of untouched (disk)" (Buffer.text disk) seed;
+let _ = check_int "len" (Buffer.len mem) 19;
+let _ = check_int "one piece on open" (Buffer.piece_count disk) 1;
+let _ = check "slice mid" (Buffer.slice disk 4 5) "quick";
+let _ = check "slice head" (Buffer.slice disk 0 3) "the";
+let _ = check "slice tail" (Buffer.slice disk 16 3) "fox";
+let _ = check "slice past end clamps" (Buffer.slice disk 16 999) "fox";
+let _ = check "slice entirely past end" (Buffer.slice disk 999 5) "";
+let _ = check "slice zero width" (Buffer.slice disk 4 0) "";
+let _ = check "slice negative from" (Buffer.slice disk (0 - 3) 3) "the";
+
+// --- insert ---------------------------------------------------------------
+let _ = both "insert at head" (fn (b: buf) -> Buffer.insert b 0 ">> ") ">> the quick brown fox";
+let _ = both "insert at tail" (fn (b: buf) -> Buffer.insert b 19 "!") "the quick brown fox!";
+let _ = both "insert past tail clamps" (fn (b: buf) -> Buffer.insert b 999 "!") "the quick brown fox!";
+let _ = both "insert mid-piece" (fn (b: buf) -> Buffer.insert b 4 "very ") "the very quick brown fox";
+let _ = both "insert empty is a no-op" (fn (b: buf) -> Buffer.insert b 4 "") seed;
+let _ = both "two inserts, later one first"
+          (fn (b: buf) -> Buffer.insert (Buffer.insert b 4 "very ") 0 "> ")
+          "> the very quick brown fox";
+
+// --- delete ---------------------------------------------------------------
+let _ = both "delete head" (fn (b: buf) -> Buffer.delete b 0 4) "quick brown fox";
+let _ = both "delete tail" (fn (b: buf) -> Buffer.delete b 15 4) "the quick brown";
+let _ = both "delete mid" (fn (b: buf) -> Buffer.delete b 3 6) "the brown fox";
+let _ = both "delete past end clamps" (fn (b: buf) -> Buffer.delete b 15 999) "the quick brown";
+let _ = both "delete zero is a no-op" (fn (b: buf) -> Buffer.delete b 3 0) seed;
+let _ = both "delete everything" (fn (b: buf) -> Buffer.delete b 0 19) "";
+
+// --- the two together -----------------------------------------------------
+let _ = both "insert then delete across the seam"
+          (fn (b: buf) -> Buffer.delete (Buffer.insert b 9 " and slow") 4 5)
+          "the  and slow brown fox";
+let _ = both "delete then insert into the hole"
+          (fn (b: buf) -> Buffer.insert (Buffer.delete b 4 6) 4 "lazy ")
+          "the lazy brown fox";
+
+// --- undo -----------------------------------------------------------------
+let _ = both "undo an insert" (fn (b: buf) -> Buffer.undo (Buffer.insert b 0 "xyz")) seed;
+let _ = both "undo a delete" (fn (b: buf) -> Buffer.undo (Buffer.delete b 0 4)) seed;
+let _ = both "undo twice"
+          (fn (b: buf) -> Buffer.undo (Buffer.undo (Buffer.insert (Buffer.insert b 0 "a") 0 "b")))
+          seed;
+let _ = both "undo past the bottom is a no-op" (fn (b: buf) -> Buffer.undo (Buffer.undo b)) seed;
+let _ = both "undo one of two"
+          (fn (b: buf) -> Buffer.undo (Buffer.insert (Buffer.insert b 0 "a") 0 "b"))
+          "athe quick brown fox";
+let _ = check_int "can_undo on a fresh buf" (if Buffer.can_undo mem then 1 else 0) 0;
+let _ = check_int "can_undo after an edit" (if Buffer.can_undo (Buffer.insert mem 0 "x") then 1 else 0) 1;
+
+// --- fusing ---------------------------------------------------------------
+// Typing a word one key at a time must not make one piece per key: each new
+// piece is adjacent in `add` to the one before it, so they merge. Without the
+// fuse, this is 5 pieces and every later split walks all of them.
+let rec typed = fn (b: buf) -> fn (at: int) -> fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then b
+  else typed (Buffer.insert b (at + i) (substring s i (i + 1))) at s (i + 1);
+
+let five = typed mem 0 "hello" 0;
+let _ = check "typing produces the text" (Buffer.text five) "hellothe quick brown fox";
+// 2, not 6: one fused Add piece plus the original.
+let _ = check_int "typing five keys fuses to one piece" (Buffer.piece_count five) 2;
+
+// Undo after fusing still goes back one KEY at a time -- the fuse is about the
+// piece list, not about the history.
+let _ = check "undo after typing steps back one key"
+          (Buffer.text (Buffer.undo five)) "hellthe quick brown fox";
+
+// --- a long document, on disk, never loaded -------------------------------
+// The point of the whole design: edit near the end of a big file without
+// reading the front of it.
+let big = "/tmp/medit2_buffer_big.txt";
+let rec mk = fn (i: int) -> fn (acc: str) ->
+  if i >= 2000 then acc else mk (i + 1) (acc ++ "line " ++ show i ++ "\n");
+let _ = write_file big (mk 0 "");
+let bigsz = file_size big;
+let bf = file_openrw big;
+let bb = Buffer.of_origin (Disk ((bf, bigsz)));
+let _ = check_int "big: one piece on open" (Buffer.piece_count bb) 1;
+let _ = check_int "big: length matches the file" (Buffer.len bb) bigsz;
+// Appending at the very end splits nothing: the original piece keeps its whole
+// extent and the typed text is one more piece after it.
+let appended = Buffer.insert bb bigsz " <<";
+let _ = check "big: append lands at the end"
+          (Buffer.slice appended (bigsz - 10) 13) "line 1999\n <<";
+let _ = check "big: the front is untouched" (Buffer.slice appended 0 7) "line 0\n";
+let _ = check_int "big: appending makes two pieces" (Buffer.piece_count appended) 2;
+
+// Editing in the MIDDLE splits the original in two, so three pieces -- and
+// still no read of the rest of the file.
+let edited = Buffer.insert bb (bigsz - 1) " <<";
+let _ = check "big: mid edit lands before the final newline"
+          (Buffer.slice edited (bigsz - 10) 13) "line 1999 <<\n";
+let _ = check_int "big: a mid edit makes three pieces" (Buffer.piece_count edited) 3;
+let _ = file_close bf;
+let _ = file_close fh;
+
+// --- report ---------------------------------------------------------------
+let n = vec_len fails;
+let rec report = fn (i: int) ->
+  if i >= n then () else let _ = print ("FAIL " ++ vec_get fails i) in report (i + 1);
+let _ = report 0;
+print (if n == 0 then "buffer: all ok" else "buffer: " ++ show n ++ " FAILED")

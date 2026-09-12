@@ -1,0 +1,5 @@
+# Emitted C and the binary it becomes: both are derived from medit2.mere by
+# `sh verify.sh`, and neither is worth a diff.
+medit2.c
+/medit2
+__pycache__/

@@ -1,0 +1,188 @@
+// src/lsp.mere — a language-server client, over one file descriptor.
+//
+// `mere lsp` speaks Content-Length-framed JSON-RPC on stdin and stdout, like
+// every other language server. The interesting part is not the protocol; it is
+// that Mere needed NOTHING NEW to talk to one.
+//
+// A socketpair gives the child a single bidirectional fd (shim/medit2_shim.c),
+// and at that point the server looks exactly like an accepted TCP connection.
+// `tcp_read` and `tcp_write` are read(2) and write(2) rather than recv/send, so
+// they work on it unchanged; `io_poll_add` takes any fd, so the editor waits on
+// the keyboard and the server in the same poll(2). No compiler change, no new
+// builtin, no second thread.
+//
+// WHAT THIS DELIBERATELY DOES NOT DO. `mere lsp` advertises
+// `textDocumentSync: 1`, full-text sync: every change sends the whole buffer.
+// That is fine for source files and wrong for the large files this editor is
+// built to open, so the editor attaches a server only to small ones. Making it
+// incremental is a change to the server, not to this client.
+
+import "mere-json/json.mere";
+
+type lsp = {
+  fd: int,
+  pending: str,     // bytes read but not yet a complete frame
+  version: int,     // didChange revision, which the protocol requires to grow
+  diag: str,        // the first diagnostic, as a line for the status bar
+  ndiag: int,
+  alive: bool,
+};
+
+module Lsp {
+
+  let crlf = chr 13 ++ chr 10;
+
+  // --- JSON string escaping ------------------------------------------------
+  // The document's own text goes into a JSON string, so every quote, backslash
+  // and control character in it has to survive the trip. A missing case here
+  // desynchronises the server from the buffer silently -- it keeps answering,
+  // about the wrong text.
+  let _esc_char = fn (c: str) ->
+    let b = ord c in
+    if b == 34 then "\\\""
+    else if b == 92 then "\\\\"
+    else if b == 10 then "\\n"
+    else if b == 13 then "\\r"
+    else if b == 9 then "\\t"
+    else if b < 32 then
+      // \u00XX, spelled out: there is no printf here and two hex digits is all
+      // a C0 control needs.
+      let hex = "0123456789abcdef" in
+      "\\u00" ++ substring hex (b / 16) (b / 16 + 1) ++ substring hex (b % 16) (b % 16 + 1)
+    else c;
+
+  let rec _esc_go = fn (cs: str list) -> fn (acc: str) ->
+    match cs with
+    | Nil -> acc
+    | Cons (c, rest) -> _esc_go rest (acc ++ _esc_char c);
+
+  // Walks BYTES, not code points: a multi-byte character's continuation bytes
+  // are all >= 0x80, so they fall through `_esc_char` unchanged and the UTF-8
+  // is passed through as-is, which is what JSON wants.
+  let rec _bytes_of = fn (s: str) -> fn (i: int) -> fn (acc: str list) ->
+    if i < 0 then acc else _bytes_of s (i - 1) (Cons (substring s i (i + 1), acc));
+
+  let escape = fn (s: str) -> _esc_go (_bytes_of s (str_len s - 1) Nil) "";
+
+  // --- framing -------------------------------------------------------------
+  let frame = fn (body: str) ->
+    "Content-Length: " ++ show (str_len body) ++ crlf ++ crlf ++ body;
+
+  // --- the connection ------------------------------------------------------
+  let connect = fn (fd: int) ->
+    (lsp { fd = fd, pending = "", version = 1, diag = "", ndiag = 0,
+           alive = fd >= 0 } : lsp);
+
+  let uri_of = fn (path: str) ->
+    // The server resolves imports against this, so it has to be absolute.
+    if str_starts_with path "/" then "file://" ++ path else "file://./" ++ path;
+
+  // The three messages that have to arrive before a server will say anything:
+  // initialize, initialized, didOpen. Sent as one write, because they are one
+  // handshake and a server that gets them in pieces is a server waiting.
+  let hello = fn (path: str) -> fn (text: str) ->
+    let uri = uri_of path in
+    let init = "\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":"
+            ++ "\{\"processId\":null,\"rootUri\":null,\"capabilities\":\{}}}" in
+    let inited = "\{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":\{}}" in
+    let opened = "\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":"
+              ++ "\{\"textDocument\":\{\"uri\":\"" ++ uri ++ "\",\"languageId\":\"mere\","
+              ++ "\"version\":1,\"text\":\"" ++ escape text ++ "\"}}}" in
+    frame init ++ frame inited ++ frame opened;
+
+  let change = fn (path: str) -> fn (v: int) -> fn (text: str) ->
+    let uri = uri_of path in
+    frame ("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":"
+        ++ "\{\"textDocument\":\{\"uri\":\"" ++ uri ++ "\",\"version\":" ++ show v ++ "},"
+        ++ "\"contentChanges\":[\{\"text\":\"" ++ escape text ++ "\"}]}}");
+
+  // --- reading -------------------------------------------------------------
+  // One frame out of the pending buffer, if a whole one is there. Returns
+  // (body, rest); an empty body means "not yet", which is the normal answer.
+  let take_frame = fn (pending: str) ->
+    let hdr_end = str_index_of pending (crlf ++ crlf) in
+    if hdr_end < 0 then ("", pending)
+    else
+      let header = substring pending 0 hdr_end in
+      let key = "Content-Length:" in
+      let at = str_index_of header key in
+      if at < 0 then ("", substring pending (hdr_end + 4) (str_len pending))
+      else
+        let after = str_trim (substring header (at + str_len key) (str_len header)) in
+        // The header may carry more fields after the length; take the digits.
+        let rec digits = fn (i: int) ->
+          if i >= str_len after then i
+          else if is_digit (char_at after i) then digits (i + 1) else i in
+        let n = int_of_str (substring after 0 (digits 0)) in
+        let body_start = hdr_end + 4 in
+        if str_len pending < body_start + n then ("", pending)
+        else (substring pending body_start (body_start + n),
+              substring pending (body_start + n) (str_len pending));
+
+  // --- diagnostics ---------------------------------------------------------
+  let _field = fn (o: json) -> fn (k: str) ->
+    match o with
+    | JObj (fields) ->
+      let rec go = fn (fs: (str * json) list) ->
+        match fs with
+        | Nil -> JNull
+        | Cons (kv, rest) -> if str_eq (fst kv) k then snd kv else go rest
+      in go fields
+    | _ -> JNull;
+
+  let _num = fn (v: json) -> match v with | JNum (n) -> n | _ -> 0;
+  let _str = fn (v: json) -> match v with | JStr (s) -> s | _ -> "";
+
+  let rec _len = fn (xs: json list) -> fn (acc: int) ->
+    match xs with Nil -> acc | Cons (_, r) -> _len r (acc + 1);
+
+  // Summarise publishDiagnostics into one status-bar line. The editor shows the
+  // FIRST one and how many there are: a status bar cannot hold a list, and the
+  // first error is the one that usually explains the rest.
+  let apply_diagnostics = fn (st: lsp) -> fn (params: json) ->
+    match _field params "diagnostics" with
+    | JArr (ds) ->
+      let n = _len ds 0 in
+      if n == 0 then ({ st | diag = "", ndiag = 0 } : lsp)
+      else
+        // Parenthesised: an unbracketed `match` in an arm swallows the OUTER
+        // wildcard arm below, and the error surfaces as "non-exhaustive" on
+        // the outer match -- a long way from the cause.
+        (match ds with
+         | Cons (d, _) ->
+           let rng = _field d "range" in
+           let line = _num (_field (_field rng "start") "line") + 1 in
+           let msg = _str (_field d "message") in
+           let more = if n > 1 then "  (+" ++ show (n - 1) ++ ")" else "" in
+           ({ st | diag = "L" ++ show line ++ ": " ++ msg ++ more, ndiag = n } : lsp)
+         | Nil -> ({ st | diag = "", ndiag = 0 } : lsp))
+    | _ -> st;
+
+  let handle = fn (st: lsp) -> fn (body: str) ->
+    // try_or, because a server is allowed to send something this client has no
+    // parser for, and an editor that dies on an unexpected notification is
+    // worse than one that ignores it.
+    try_or (fn () ->
+      let v = Json.parse_json body in
+      let m = _str (_field v "method") in
+      if str_eq m "textDocument/publishDiagnostics"
+      then apply_diagnostics st (_field v "params")
+      else st) st;
+
+  let rec _drain = fn (st: lsp) ->
+    let taken = take_frame st.pending in
+    let body = fst taken in
+    if str_eq body "" then st
+    else _drain (handle ({ st | pending = snd taken } : lsp) body);
+
+  // Called with whatever came off the fd. Splitting "read the socket" from
+  // "consume frames" is what lets the editor own the read (it already has the
+  // arena and the poll set) and this file own the protocol.
+  let feed = fn (st: lsp) -> fn (chunk: str) ->
+    _drain ({ st | pending = st.pending ++ chunk } : lsp);
+
+  let status = fn (st: lsp) ->
+    if not st.alive then ""
+    else if st.ndiag == 0 then "lsp ok"
+    else st.diag;
+}

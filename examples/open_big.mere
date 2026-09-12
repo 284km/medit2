@@ -1,0 +1,40 @@
+// examples/open_big.mere — the headline claim, as a program you can run.
+//
+//   mere -c examples/open_big.mere > /tmp/ob.c
+//   clang -O2 -Wno-conditional-type-mismatch /tmp/ob.c -o /tmp/ob
+//   /usr/bin/time -l /tmp/ob
+//
+// Make the input first (208 MB / 2.6M lines):
+//   python3 -c "
+// with open('/tmp/medit2_big.txt','wb') as f:
+//     line=('x'*79+chr(10)).encode()
+//     for _ in range(2_600_000): f.write(line)"
+//
+// Opens it, indexes its lines, jumps to line 2,000,000, edits there and undoes
+// the edit -- at about 25 MB of resident memory, almost all of which is the
+// line index. The document itself is never read.
+
+import "../src/buffer.mere";
+import "../src/lines.mere";
+// M2: open a 208 MB file, index it, edit near the end, read a screen — never loading it
+let path = "/tmp/medit2_big.txt";
+let sz = file_size path;
+let f = file_openrw path;
+let o = Disk ((f, sz));
+let b = Buffer.of_origin o;
+let idx = Lines.index_of o;
+let _ = print ("file  = " ++ show sz ++ " bytes") in
+let _ = print ("lines = " ++ show (Lines.count idx)) in
+let _ = print ("pieces on open = " ++ show (Buffer.piece_count b)) in
+// jump to line 2,000,000 and read it
+let ln = 2000000 in
+let s = Lines.start_of idx ln in
+let e = Lines.end_of idx ln sz in
+let _ = print ("line " ++ show ln ++ " = [" ++ Buffer.slice b s (e - s) ++ "]") in
+let _ = print ("line_at(" ++ show s ++ ") = " ++ show (Lines.line_at idx s)) in
+// edit there
+let b2 = Buffer.insert b s "EDITED " in
+let _ = print ("after edit  = [" ++ Buffer.slice b2 s ((e - s) + 7) ++ "]") in
+let _ = print ("pieces      = " ++ show (Buffer.piece_count b2)) in
+let _ = print ("undo        = [" ++ Buffer.slice (Buffer.undo b2) s (e - s) ++ "]") in
+file_close f

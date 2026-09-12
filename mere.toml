@@ -1,0 +1,6 @@
+[package]
+name = "medit2"
+version = "0.1.0"
+path = "github.com/284km/medit2"
+
+[dependencies]

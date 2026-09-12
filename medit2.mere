@@ -1,0 +1,421 @@
+// medit2.mere — a terminal editor that does not load the file.
+//
+// Build:
+//   mere -c medit2.mere > medit2.c
+//   clang -O2 -Wno-conditional-type-mismatch medit2.c shim/medit2_shim.c -o medit2
+//   ./medit2 FILE
+//
+// Keys: arrows / hjkl-free (this is modeless), Ctrl-S save, Ctrl-Q quit,
+// Ctrl-Z undo, Backspace, Enter, printable text.
+//
+// THE TWO STRUCTURAL RULES, both measured rather than assumed:
+//
+//   1. ONE REGION BLOCK PER REDRAW. Building a 40x120 screen 20,000 times
+//      costs 5.9 GB without one and 2.0 MB with one -- 2890x. An editor
+//      redraws on every keystroke, so this is the difference between a session
+//      that runs all day and one that does not.
+//
+//   2. THE EDIT IS NOT INSIDE THAT BLOCK. A region block reclaims what its
+//      body allocated, and the new piece list IS allocated by the edit. State
+//      transitions happen outside; only the screen string is built inside.
+//      Getting this backwards frees the document.
+
+import "src/buffer.mere";
+import "src/lines.mere";
+import "mere-unicode/width.mere";
+import "src/lsp.mere";
+
+// --- the host -------------------------------------------------------------
+// Implemented in shim/medit2_shim.c. The compiler emits an `extern` prototype
+// for any name it does not implement itself, so no compiler change is needed.
+extern fn term_rows: unit -> int;
+// tty_raw clears ICANON and ECHO and stops there: it leaves IXON on (Ctrl-S is
+// XOFF, freezing the terminal) and ISIG on (Ctrl-Z is SUSP, so undo never arrives).
+extern fn term_editor_mode: unit -> int;
+extern fn term_cols: unit -> int;
+
+// Already in the C backend's own runtime: readiness over any fd, and read/write
+// that are read(2)/write(2) rather than recv/send.
+extern fn io_poll_new: int -> int;
+extern fn io_poll_add: int -> int -> int -> int;
+extern fn io_poll_wait: int -> int -> int;
+extern fn io_poll_get: int -> int -> int;
+extern fn tcp_read: int -> int -> int -> int;
+extern fn tcp_write: int -> int -> int -> int;
+extern fn tcp_close: int -> unit;
+extern fn mem_copy_str: int -> int -> str -> int;
+extern fn mem_to_str: int -> int -> str;
+// shim/medit2_shim.c: a child process on one bidirectional fd.
+extern fn proc_open: str -> int;
+extern fn mem_alloc: int -> int;
+extern fn mem_get_u8: int -> int -> int;
+
+type ed = {
+  buf: buf,
+  starts: Vec[R, int],
+  total: int,        // document length in bytes
+  cur: int,          // cursor, as a byte offset
+  goal: int,         // preferred column, kept across vertical moves
+  top: int,          // first visible line
+  rows: int,
+  cols: int,
+  path: str,
+  msg: str,
+  dirty: bool,
+  quit: bool,
+  // What an EastAsianWidth=Ambiguous character is worth on THIS terminal:
+  // 1 normally, 2 when it is configured for CJK. The standard declines to
+  // decide, so the editor is told rather than guessing (--wide).
+  amb: int,
+  lsp: lsp,
+  // A change the server has not been told about yet. Sent when the editor goes
+  // idle rather than on every keystroke: `mere lsp` syncs FULL TEXT, so a
+  // keystroke-by-keystroke didChange re-sends the whole buffer per key, down
+  // the same path where per-keystroke rechecking has gone quadratic before.
+  dirty_for_lsp: bool,
+};
+
+let esc = chr 27;
+
+// --- the line index, maintained rather than rebuilt ------------------------
+// Rebuilding a 2.6M-line index per keystroke costs 0.4 s. An edit shifts every
+// start after it by a fixed delta and adds or removes the ones inside it, which
+// is a walk of the tail.
+
+let rec _shift_from = fn (v: Vec[R, int]) -> fn (i: int) -> fn (n: int) -> fn (d: int) ->
+  if i >= n then () else
+  let _ = vec_set v i (vec_get v i + d) in
+  _shift_from v (i + 1) n d;
+
+// Rebuild the index from the buffer. Correct but O(document); used at open and
+// after an undo, where the delta is not known.
+let reindex = fn (st: ed) ->
+  let n = Buffer.len st.buf in
+  let starts = vec_new () in
+  let _ = vec_push starts 0 in
+  let rec page = fn (off: int) ->
+    if off >= n then () else
+    let want = if off + Lines.page_size > n then n - off else Lines.page_size in
+    let _ = region P {
+      let s = Buffer.slice st.buf off want in
+      let b = bytes_of_str s in
+      Lines._scan_page starts b 0 (bytes_len b) off
+    } in
+    page (off + want)
+  in
+  let _ = page 0 in
+  ({ st | starts = starts, total = n } : ed);
+
+// --- cursor ---------------------------------------------------------------
+let cur_line = fn (st: ed) -> Lines.line_at st.starts st.cur;
+let line_start = fn (st: ed) -> fn (l: int) -> Lines.start_of st.starts l;
+let line_end = fn (st: ed) -> fn (l: int) -> Lines.end_of st.starts l st.total;
+let line_len = fn (st: ed) -> fn (l: int) -> line_end st l - line_start st l;
+
+let clamp = fn (x: int) -> fn (lo: int) -> fn (hi: int) ->
+  if x < lo then lo else if x > hi then hi else x;
+
+// --- UTF-8 boundaries -----------------------------------------------------
+// Moving the cursor by ONE BYTE lands inside a multi-byte character, and every
+// slice taken from there is garbage. A continuation byte is 10xxxxxx, so the
+// boundaries are the bytes that are not.
+let _is_cont = fn (b: int) -> b >= 128 && b < 192;
+
+let _byte_at = fn (st: ed) -> fn (off: int) ->
+  if off < 0 || off >= st.total then 0
+  else ord (Buffer.slice st.buf off 1);
+
+let rec _fwd = fn (st: ed) -> fn (off: int) ->
+  if off >= st.total then st.total
+  else if _is_cont (_byte_at st off) then _fwd st (off + 1)
+  else off;
+
+let rec _back = fn (st: ed) -> fn (off: int) ->
+  if off <= 0 then 0
+  else if _is_cont (_byte_at st off) then _back st (off - 1)
+  else off;
+
+let next_char = fn (st: ed) -> fn (off: int) -> _fwd st (off + 1);
+let prev_char = fn (st: ed) -> fn (off: int) -> _back st (off - 1);
+
+// Keep the cursor's line on screen. Called after every move.
+let scroll = fn (st: ed) ->
+  let l = cur_line st in
+  let body = st.rows - 1 in
+  let top = if l < st.top then l
+            else if l >= st.top + body then l - body + 1
+            else st.top in
+  ({ st | top = if top < 0 then 0 else top } : ed);
+
+let move_to = fn (st: ed) -> fn (off: int) ->
+  let c = clamp off 0 st.total in
+  let l = Lines.line_at st.starts c in
+  scroll ({ st | cur = c, goal = c - Lines.start_of st.starts l } : ed);
+
+let move_vert = fn (st: ed) -> fn (d: int) ->
+  let l = cur_line st in
+  let nl = clamp (l + d) 0 (Lines.count st.starts - 1) in
+  let want = clamp st.goal 0 (line_len st nl) in
+  let c = clamp (line_start st nl + want) 0 st.total in
+  // goal survives the move: going down through a short line and back up
+  // returns to the column you left, which is what every editor does.
+  scroll ({ st | cur = c } : ed);
+
+// --- editing --------------------------------------------------------------
+// Each of these returns a NEW state and must run outside the redraw's region.
+
+let do_insert = fn (st: ed) -> fn (s: str) ->
+  let b = Buffer.insert st.buf st.cur s in
+  let n = str_len s in
+  let l = Lines.line_at st.starts st.cur in
+  // Shift every later start, then insert a start for each newline typed.
+  let _ = _shift_from st.starts (l + 1) (vec_len st.starts) n in
+  let st = ({ st | buf = b, total = st.total + n } : ed) in
+  // A newline changes the line structure; rebuilding is rare enough to afford.
+  let st = if str_contains s (chr 10) then reindex st else st in
+  move_to ({ st | dirty = true, dirty_for_lsp = true } : ed) (st.cur + n);
+
+// Backspace removes a whole CHARACTER, not a byte: deleting one byte of a
+// three-byte kanji leaves two bytes that are not any character at all.
+let do_delete_back = fn (st: ed) ->
+  if st.cur <= 0 then st
+  else
+    let from = prev_char st st.cur in
+    let n = st.cur - from in
+    let removed = Buffer.slice st.buf from n in
+    let b = Buffer.delete st.buf from n in
+    let st = ({ st | buf = b, total = st.total - n, dirty = true, dirty_for_lsp = true } : ed) in
+    let st = if str_contains removed (chr 10) then reindex st
+             else
+               let l = Lines.line_at st.starts st.cur in
+               let _ = _shift_from st.starts (l + 1) (vec_len st.starts) (0 - n) in
+               st in
+    move_to st from;
+
+let do_undo = fn (st: ed) ->
+  if Buffer.can_undo st.buf then
+    let st = reindex ({ st | buf = Buffer.undo st.buf } : ed) in
+    move_to ({ st | msg = "undo", dirty = true, dirty_for_lsp = true } : ed) st.cur
+  else ({ st | msg = "nothing to undo" } : ed);
+
+let do_save = fn (st: ed) ->
+  // Written in one go through the buffer, which for a huge file means reading
+  // it back through the piece table a page at a time rather than all at once.
+  let out = file_openrw (st.path ++ ".medit2.tmp") in
+  let rec put = fn (off: int) ->
+    if off >= st.total then () else
+    let want = if off + Lines.page_size > st.total then st.total - off else Lines.page_size in
+    let _ = region P {
+      let s = Buffer.slice st.buf off want in
+      file_pwrite_bytes out off (bytes_of_str s)
+    } in
+    put (off + want)
+  in
+  let _ = put 0 in
+  let _ = file_fsync out in
+  let _ = file_close out in
+  let _ = run ("mv " ++ st.path ++ ".medit2.tmp " ++ st.path) in
+  ({ st | dirty = false, msg = "wrote " ++ show st.total ++ " bytes" } : ed);
+
+// --- rendering ------------------------------------------------------------
+// Everything below runs INSIDE the frame's region block. It must not allocate
+// anything the next frame needs -- strings only, no containers.
+
+let rec _render_rows = fn (st: ed) -> fn (l: int) -> fn (n: int) -> fn (acc: str) ->
+  if n <= 0 then acc
+  else
+    let nlines = Lines.count st.starts in
+    let body =
+      if l >= nlines then "~"
+      else
+        let s = line_start st l in
+        let e = line_end st l in
+        // Read at most 4 bytes per column -- the widest a UTF-8 character gets
+        // -- then clip by COLUMNS. Clipping by bytes puts half a kanji at the
+        // right edge, and half a kanji is not something a terminal can draw:
+        // it corrupts every line below it.
+        let raw = Buffer.slice st.buf s (if e - s > st.cols * 4 then st.cols * 4 else e - s) in
+        substring raw 0 (Width.take_cols_amb st.amb raw st.cols) in
+    _render_rows st (l + 1) (n - 1) (acc ++ esc ++ "[K" ++ body ++ chr 13 ++ chr 10);
+
+let render = fn (st: ed) ->
+  let l = cur_line st in
+  let s0 = line_start st l in
+  // The cursor's screen column is not its byte offset: every wide character
+  // before it counts twice and every combining mark counts nothing.
+  let before = Buffer.slice st.buf s0 (st.cur - s0) in
+  let col = Width.cols_before_amb st.amb before (str_len before) in
+  let status =
+    esc ++ "[7m" ++ st.path ++ (if st.dirty then " *" else "")
+    ++ "  L" ++ show (l + 1) ++ "/" ++ show (Lines.count st.starts)
+    ++ " C" ++ show (col + 1)
+    ++ "  " ++ show st.total ++ "B"
+    ++ (if str_eq st.msg "" then "" else "  " ++ st.msg)
+    ++ (let d = Lsp.status st.lsp in if str_eq d "" then "" else "  [" ++ d ++ "]")
+    ++ esc ++ "[0m" in
+  let screen = _render_rows st st.top (st.rows - 1) "" in
+  // Cursor to (row, col) in 1-based terminal coordinates.
+  let place = esc ++ "[" ++ show (l - st.top + 1) ++ ";" ++ show (col + 1) ++ "H" in
+  esc ++ "[H" ++ screen ++ status ++ place;
+
+// --- input ----------------------------------------------------------------
+// One read of everything waiting, then decode. Reading a byte at a time cannot
+// tell ESC from the start of an arrow key without a timer; a chunk can.
+
+let kbuf = mem_alloc 4096;
+let lbuf = mem_alloc 262144;
+
+let rec _apply = fn (st: ed) -> fn (i: int) -> fn (n: int) ->
+  if i >= n then st
+  else
+    let c = mem_get_u8 kbuf i in
+    if c == 17 then ({ st | quit = true } : ed)                 // Ctrl-Q
+    else if c == 19 then _apply (do_save st) (i + 1) n          // Ctrl-S
+    else if c == 26 then _apply (do_undo st) (i + 1) n          // Ctrl-Z
+    else if c == 127 then _apply (do_delete_back st) (i + 1) n  // Backspace
+    else if c == 13 then _apply (do_insert st (chr 10)) (i + 1) n
+    else if c == 27 then
+      // ESC [ A/B/C/D, and ESC alone when nothing follows.
+      if i + 2 < n then
+        if mem_get_u8 kbuf (i + 1) == 91 then
+          let d = mem_get_u8 kbuf (i + 2) in
+          let st2 = if d == 65 then move_vert st (0 - 1)
+                    else if d == 66 then move_vert st 1
+                    else if d == 67 then move_to st (next_char st st.cur)
+                    else if d == 68 then move_to st (prev_char st st.cur)
+                    else st in
+          _apply st2 (i + 3) n
+        else _apply st (i + 2) n
+      else st
+    else if c < 32 then _apply st (i + 1) n
+    else
+      // A run of printable bytes goes in as one insert, so a paste is one edit
+      // and one undo step rather than one per byte.
+      let rec run_end = fn (j: int) ->
+        if j >= n then j
+        else let d = mem_get_u8 kbuf j in
+             if d >= 32 && d != 127 then run_end (j + 1) else j in
+      let e = run_end i in
+      let rec gather = fn (j: int) -> fn (acc: str) ->
+        if j >= e then acc else gather (j + 1) (acc ++ chr (mem_get_u8 kbuf j)) in
+      _apply (do_insert st (gather i "")) e n;
+
+// --- the loop -------------------------------------------------------------
+let poll = io_poll_new 0;
+let _ = io_poll_add poll 0 1;
+
+// Tell the server what the buffer says now. Called when the editor goes idle,
+// not per keystroke.
+let push_change = fn (st: ed) ->
+  if not st.lsp.alive || not st.dirty_for_lsp then st
+  else
+    let v = st.lsp.version + 1 in
+    let msg = Lsp.change st.path v (Buffer.text st.buf) in
+    let n = mem_copy_str lbuf 0 msg in
+    let w = tcp_write st.lsp.fd lbuf n in
+    if w < 0 then ({ st | lsp = ({ st.lsp | alive = false } : lsp), dirty_for_lsp = false } : ed)
+    else ({ st | lsp = ({ st.lsp | version = v } : lsp), dirty_for_lsp = false } : ed);
+
+let read_lsp = fn (st: ed) ->
+  let n = tcp_read st.lsp.fd lbuf 262144 in
+  if n <= 0 then ({ st | lsp = ({ st.lsp | alive = false } : lsp) } : ed)
+  else ({ st | lsp = Lsp.feed st.lsp (mem_to_str lbuf n) } : ed);
+
+// One ready event at a time: fd 0 is the keyboard, anything else is the server.
+let rec _serve = fn (st: ed) -> fn (i: int) -> fn (n: int) ->
+  if i >= n || st.quit then st
+  else
+    let ev = io_poll_get poll i in
+    let fd = ev / 8 in
+    let st2 =
+      if fd == 0 then
+        let got = tcp_read 0 kbuf 4096 in
+        if got <= 0 then ({ st | quit = true } : ed)
+        // Rule 2: the edit happens OUTSIDE the frame's region, because the new
+        // piece list has to outlive the frame.
+        else _apply ({ st | msg = "" } : ed) 0 got
+      else read_lsp st
+    in
+    _serve st2 (i + 1) n;
+
+let rec loop = fn (st: ed) ->
+  if st.quit then st
+  else
+    // Rule 1: the screen string is built and thrown away inside a region.
+    let _ = region F { print_no_nl (render st) } in
+    let ready = io_poll_wait poll 250 in
+    if ready <= 0 then
+      // Idle. Two things happen here and nowhere else: the server is told
+      // about accumulated edits, and the terminal is re-asked for its size --
+      // which is how a resize is noticed without a SIGWINCH handler racing the
+      // redraw.
+      let st = push_change st in
+      let r = term_rows () in
+      let c = term_cols () in
+      if r > 0 && (r != st.rows || c != st.cols) then
+        loop (scroll ({ st | rows = r, cols = c } : ed))
+      else loop st
+    else loop (_serve st 0 ready);
+
+// --- entry ----------------------------------------------------------------
+let argv = args ();
+
+// --wide says this terminal draws EastAsianWidth=Ambiguous characters (±, ※,
+// the box-drawing set) in two columns, which a terminal configured for CJK
+// does. There is no right default: the standard declines to decide, so the
+// editor is told.
+let rec _has_wide = fn (xs: str list) ->
+  match xs with
+  | Nil -> false
+  | Cons (x, rest) -> if str_eq x "--wide" then true else _has_wide rest;
+
+let rec _first_path = fn (xs: str list) ->
+  match xs with
+  | Nil -> ""
+  | Cons (x, rest) -> if str_starts_with x "--" then _first_path rest else x;
+
+let amb_width = if _has_wide argv then 2 else 1;
+
+match _first_path argv with
+  | "" -> print "usage: medit2 [--wide] FILE"
+  | path ->
+    let _ = if file_exists path then () else write_file path "" in
+    let sz = file_size path in
+    let f = file_openrw path in
+    let o = Disk ((f, sz)) in
+    let r0 = term_rows () in
+    let c0 = term_cols () in
+    // A language server is attached to SOURCE files only, and small ones.
+    // `mere lsp` syncs full text, so pointing it at the 208 MB file this
+    // editor exists to open would re-send 208 MB on every idle tick. The two
+    // axes do not overlap and the editor should not pretend they do.
+    let want_lsp = str_ends_with path ".mere" && sz < 1048576 in
+    let lfd = if want_lsp then proc_open "mere lsp" else (0 - 1) in
+    let _ = if lfd >= 0 then io_poll_add poll lfd 1 else 0 in
+    let lsp0 = Lsp.connect lfd in
+    let lsp0 = if lfd < 0 then lsp0
+               else
+                 let hi = Lsp.hello path (read_file path) in
+                 let n = mem_copy_str lbuf 0 hi in
+                 let w = tcp_write lfd lbuf n in
+                 if w < 0 then ({ lsp0 | alive = false } : lsp) else lsp0 in
+    let st0 = (ed { buf = Buffer.of_origin o,
+                 starts = Lines.index_of o,
+                 total = sz,
+                 cur = 0, goal = 0, top = 0,
+                 rows = if r0 > 0 then r0 else 24,
+                 cols = if c0 > 0 then c0 else 80,
+                 path = path,
+                 msg = "Ctrl-S save  Ctrl-Q quit  Ctrl-Z undo",
+                 dirty = false, quit = false, amb = amb_width,
+                 lsp = lsp0, dirty_for_lsp = false } : ed) in
+    let _ = tty_raw () in
+    let _ = term_editor_mode () in
+    let _ = print_no_nl (esc ++ "[2J") in
+    let fin = loop st0 in
+    let _ = tty_restore () in
+    let _ = print_no_nl (esc ++ "[2J" ++ esc ++ "[H") in
+    let _ = if fin.lsp.alive then tcp_close fin.lsp.fd else () in
+    let _ = file_close f in
+    print ("medit2: " ++ path ++ " " ++ show fin.total ++ " bytes"
+           ++ (if fin.dirty then " (unsaved)" else ""))
