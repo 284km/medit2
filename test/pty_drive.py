@@ -249,6 +249,45 @@ def scenario_japanese_clip(binary):
     s.close()
 
 
+def scenario_emoji(binary):
+    """A ZWJ sequence is ONE character, two columns wide.
+
+    Code-point width counts each pictograph in 👩‍👩‍👦 and reports six, so the
+    cursor ends up four columns past where the glyph actually ends and every
+    line drawn after it is wrong. This is the case that needed grapheme
+    clustering to be affordable per-frame before it could be fixed.
+    """
+    path = "/tmp/medit2_pty_emoji.txt"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\U0001F469\u200D\U0001F469\u200D\U0001F466ab\n")
+
+    s = Session([binary, path])
+    # TWO rights: past the family and past the `a`. Column 4 -- the family is
+    # two columns and `a` is one.
+    #
+    # Two and not one, deliberately. After a single RIGHT a code-point-stepping
+    # editor also reports C3, because it lands on the first 👩 which is itself
+    # two columns wide: the check would pass while naming something it was not
+    # testing. The second step is what separates them -- by cluster it lands
+    # after `a` (C4), by code point it is still inside the family (C5).
+    s.send(RIGHT)
+    s.send(RIGHT)
+    check("a ZWJ family is ONE character, two columns", s.wait_for("C4"), True)
+
+    # Now step back over the `a` and delete the family itself: backspace has to
+    # remove the whole cluster, not one code point of it. A code-point editor
+    # leaves \u200d👩\u200d👦 behind, which is not any character at all.
+    s.send(LEFT)
+    s.send(BACKSPACE)
+    s.send(CTRL_S)
+    s.send(CTRL_Q)
+    s.close()
+
+    with open(path, encoding="utf-8") as f:
+        got = f.read()
+    check("backspace removed the whole ZWJ sequence", got, "ab\n")
+
+
 def scenario_lsp(binary):
     """The language server, over a socketpair, in the same poll(2) as the keyboard.
 
@@ -309,6 +348,7 @@ def main():
     scenario_backspace_and_enter(binary)
     scenario_japanese(binary)
     scenario_japanese_clip(binary)
+    scenario_emoji(binary)
     scenario_lsp(binary)
 
     for f in FAILS:

@@ -45,9 +45,9 @@ guessing.
 
 | | |
 |---|---|
-| arrows | move; left/right step by **character**, not byte |
+| arrows | move; left/right step by **grapheme cluster** — not a byte, and not a code point |
 | printable text | insert — a paste arrives as one edit and one undo step |
-| Enter / Backspace | as expected; backspace removes a whole character |
+| Enter / Backspace | as expected; backspace removes a whole cluster |
 | Ctrl-S | save |
 | Ctrl-Z | undo |
 | Ctrl-Q | quit |
@@ -95,6 +95,12 @@ Widths come from Mere's `contrib/unicode/width.mere`, vendored here under
 17,793 code points agree, and every difference is in a category with a reason
 attached rather than a waiver.
 
+Widths and cursor movement are both by **grapheme cluster**, not code point, so
+`👩‍👩‍👦` is one character two columns wide rather than seven code points of six —
+and backspace removes the whole thing rather than leaving a joiner and two
+pictographs that are not any character at all. That needed the clustering to
+stop allocating a container per cluster first, which is [PAIN.md](./PAIN.md) P3.
+
 ## The language server
 
 `./medit2 foo.mere` starts `mere lsp` and shows its diagnostics in the status
@@ -131,11 +137,20 @@ the behaviour it names is broken.
 
 ## Why it exists
 
-A dogfood for Mere, and the record of what it needed:
-[PAIN.md](./PAIN.md). Four went upstream — `file_pread_bytes`, `file_pread`'s
-region binding, what a released region hands back, and the readiness API being
-documented at all. Four are worked around, two of those in the shim and wanting
-their own upstream slice. Three remain open.
+A dogfood for Mere, and the record of what it needed: [PAIN.md](./PAIN.md).
+**Ten of its eleven findings went upstream** — a positioned read that builds
+`bytes`, two region-lifetime bugs, raw mode not delivering the keys a program
+asked for, display width existing at all, grapheme clustering that a renderer
+can afford, a lexer papercut, an unchecked `extern` arity, and a warning on
+every emitted `match`.
+
+The one that stayed is the interesting one. A container allocated inside a
+called function goes to the program-lifetime region rather than to the `region`
+block around the call, and that is conservative **on purpose** — the type
+system's level discipline is what separates an allocation that is internal from
+one shared with something that outlives the call, and it declines to guess. What
+was fixable was the caller: the clustering that made it hurt no longer allocates
+a container at all.
 
 The first [medit](https://github.com/284km/medit) (2026-07) was deliberately a
 probe that added no capability. This one asked the opposite question.

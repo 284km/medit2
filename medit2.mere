@@ -23,15 +23,18 @@
 import "src/buffer.mere";
 import "src/lines.mere";
 import "mere-unicode/width.mere";
+import "mere-unicode/grapheme.mere";
 import "src/lsp.mere";
 
 // --- the host -------------------------------------------------------------
 // Implemented in shim/medit2_shim.c. The compiler emits an `extern` prototype
 // for any name it does not implement itself, so no compiler change is needed.
 extern fn term_rows: unit -> int;
-// tty_raw clears ICANON and ECHO and stops there: it leaves IXON on (Ctrl-S is
-// XOFF, freezing the terminal) and ISIG on (Ctrl-Z is SUSP, so undo never arrives).
-extern fn term_editor_mode: unit -> int;
+// What raw mode leaves to the program: Enter as 13 rather than 10, and no
+// \n -> \r\n translation on the way out. The flow-control and signal-key
+// halves are upstream now (tty_raw clears IXON, tty_no_signal_keys clears
+// ISIG) -- this editor found both, and neither was its private problem.
+extern fn term_editor_output: unit -> int;
 extern fn term_cols: unit -> int;
 
 // Already in the C backend's own runtime: readiness over any fd, and read/write
@@ -115,28 +118,52 @@ let line_len = fn (st: ed) -> fn (l: int) -> line_end st l - line_start st l;
 let clamp = fn (x: int) -> fn (lo: int) -> fn (hi: int) ->
   if x < lo then lo else if x > hi then hi else x;
 
-// --- UTF-8 boundaries -----------------------------------------------------
-// Moving the cursor by ONE BYTE lands inside a multi-byte character, and every
-// slice taken from there is garbage. A continuation byte is 10xxxxxx, so the
-// boundaries are the bytes that are not.
-let _is_cont = fn (b: int) -> b >= 128 && b < 192;
+// --- character boundaries -------------------------------------------------
+// A CHARACTER here is a grapheme cluster, not a byte and not a code point.
+// Moving by a byte lands inside a multi-byte encoding and every slice from
+// there is garbage; moving by a CODE POINT is better and still wrong, because
+// "e" + U+0301 is one character a reader sees and deletes as one, and a ZWJ
+// emoji sequence is one character made of seven code points. Stepping by code
+// point leaves half a family behind.
+//
+// The line is clustered to answer this. That is affordable per keystroke
+// because clustering allocates in the caller's region as of mere v0.1.476 --
+// it used to leak a container per cluster, which is why this walked bytes.
+let rec _cluster_starts = fn (cs: str list) -> fn (at: int) -> fn (acc: int list) ->
+  match cs with
+  | Nil -> list_rev (Cons (at, acc))
+  | Cons (c, rest) -> _cluster_starts rest (at + str_len c) (Cons (at, acc));
 
-let _byte_at = fn (st: ed) -> fn (off: int) ->
-  if off < 0 || off >= st.total then 0
-  else ord (Buffer.slice st.buf off 1);
+// Byte offsets of every cluster boundary on the line the cursor is on, plus the
+// line's end, as offsets into the DOCUMENT.
+let line_boundaries = fn (st: ed) -> fn (l: int) ->
+  let s = line_start st l in
+  let e = line_end st l in
+  let text = Buffer.slice st.buf s (e - s) in
+  _cluster_starts (Grapheme.clusters text) s Nil;
 
-let rec _fwd = fn (st: ed) -> fn (off: int) ->
-  if off >= st.total then st.total
-  else if _is_cont (_byte_at st off) then _fwd st (off + 1)
-  else off;
+let rec _next_after = fn (bs: int list) -> fn (off: int) -> fn (dflt: int) ->
+  match bs with
+  | Nil -> dflt
+  | Cons (b, rest) -> if b > off then b else _next_after rest off dflt;
 
-let rec _back = fn (st: ed) -> fn (off: int) ->
-  if off <= 0 then 0
-  else if _is_cont (_byte_at st off) then _back st (off - 1)
-  else off;
+let rec _prev_before = fn (bs: int list) -> fn (off: int) -> fn (best: int) ->
+  match bs with
+  | Nil -> best
+  | Cons (b, rest) -> if b < off then _prev_before rest off b else best;
 
-let next_char = fn (st: ed) -> fn (off: int) -> _fwd st (off + 1);
-let prev_char = fn (st: ed) -> fn (off: int) -> _back st (off - 1);
+let next_char = fn (st: ed) -> fn (off: int) ->
+  let l = Lines.line_at st.starts off in
+  let e = line_end st l in
+  // Past the end of the line, the next character is the newline itself.
+  if off >= e then (if off + 1 > st.total then st.total else off + 1)
+  else _next_after (line_boundaries st l) off st.total;
+
+let prev_char = fn (st: ed) -> fn (off: int) ->
+  let l = Lines.line_at st.starts off in
+  let s = line_start st l in
+  if off <= s then (if off <= 0 then 0 else off - 1)
+  else _prev_before (line_boundaries st l) off s;
 
 // Keep the cursor's line on screen. Called after every move.
 let scroll = fn (st: ed) ->
@@ -410,7 +437,8 @@ match _first_path argv with
                  dirty = false, quit = false, amb = amb_width,
                  lsp = lsp0, dirty_for_lsp = false } : ed) in
     let _ = tty_raw () in
-    let _ = term_editor_mode () in
+    let _ = tty_no_signal_keys () in
+    let _ = term_editor_output () in
     let _ = print_no_nl (esc ++ "[2J") in
     let fin = loop st0 in
     let _ = tty_restore () in

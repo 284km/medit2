@@ -86,35 +86,30 @@ int proc_reap(void) {
   return n;
 }
 
-/* --- the rest of raw mode ------------------------------------------------
- * Mere's tty_raw clears ICANON and ECHO and stops there, which is enough for a
- * roguelike reading hjkl. It is not enough for an editor, because it leaves
- * IXON on: Ctrl-S is XOFF, so the FIRST time anyone presses the save key the
- * terminal stops drawing and the editor looks hung. Ctrl-Q is XON, so quitting
- * appears to fix it, which is a good way to never find the bug.
+/* --- what tty_raw still leaves to the program ---------------------------
+ * Two input/output translations, and they are the editor's own choice rather
+ * than something raw mode should decide:
  *
- * ISIG is the same story one key over. tty_raw documents that it keeps ISIG,
- * which is right for a game -- Ctrl-C should still kill it. It is wrong for an
- * editor, because Ctrl-Z is then SUSP and never arrives as a byte, so undo
- * silently does nothing. That one only shows up under a real terminal: through
- * a pipe there is no line discipline, 0x1a arrives, and undo works. A piped
- * test would have called this feature finished.
+ *   ICRNL  with it on, Enter arrives as 10 and is indistinguishable from a
+ *          pasted newline. Cleared, Enter is 13 and the editor can tell them
+ *          apart -- which matters, because one starts a line and the other is
+ *          content.
+ *   OPOST  with it on the terminal turns every \n into \r\n. The editor emits
+ *          its own \r\n, so leaving it on doubles the carriage return.
  *
- * Called after tty_raw, so it only has to clear what tty_raw left. Also drops
- * the flags every raw-mode terminal wants gone: ICRNL (so Enter arrives as 13
- * rather than 10 and the editor can tell Enter from a pasted newline), and
- * OPOST (so the editor's own \r\n is what reaches the screen).
- *
- * Ctrl-C is given up along with the rest, so the editor MUST have a working
- * quit key -- which is why Ctrl-Q is checked before anything else can fail.
+ * The flow-control and signal-key halves used to be here too. They are not any
+ * more: `tty_raw` clears IXON/IXOFF as of mere v0.1.476 (Ctrl-S was XOFF, so
+ * the save key froze the terminal), and `tty_no_signal_keys` clears ISIG for a
+ * program that wants Ctrl-Z as a byte rather than as SUSP. Both went upstream
+ * because they are not this editor's private problem -- the medit dogfood had
+ * the same bug and could not be saved or quit from at all.
  */
 #include <termios.h>
 
-int term_editor_mode(void) {
+int term_editor_output(void) {
   struct termios t;
   if (tcgetattr(0, &t) != 0) return -1;   /* not a tty: piped input, fine */
-  t.c_iflag &= ~(IXON | IXOFF | ICRNL);
-  t.c_lflag &= ~ISIG;
+  t.c_iflag &= ~ICRNL;
   t.c_oflag &= ~OPOST;
   return tcsetattr(0, TCSANOW, &t) == 0 ? 0 : -1;
 }
