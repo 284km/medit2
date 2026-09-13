@@ -305,6 +305,28 @@ def main():
         s.timed(ESC, what="close search")
     report("search, whole-file miss", misses)
 
+    # --- typing a needle, one key at a time ---------------------------------
+    # THE TWO ABOVE SEND THE WHOLE NEEDLE IN ONE WRITE, which is not what a
+    # person does and not what it costs. The editor reads everything waiting
+    # and searches once, so those numbers are the cost of ONE search -- they
+    # cannot see that the prompt re-searches on every keystroke, which is
+    # where the time actually went: five characters of an absent needle were
+    # five whole-file scans, 860 ms on 1 GB.
+    #
+    # So this sends one byte at a time and reports every keystroke, not a
+    # median. The shape is the point: the first may be a full scan, and the
+    # rest should not be.
+    def typed(needle, what):
+        s.timed(CTRL_F, what="open search")
+        each = [s.timed(bytes([c]), timeout=120, what=what)[0] for c in needle]
+        s.timed(ESC, what="close search")
+        print("%-22s %s  total %6.1f ms"
+              % (what, " ".join("%.1f" % m for m in each), sum(each)))
+        sys.stdout.flush()
+
+    typed(b"zzq-x", "typed, absent")
+    typed(b"ZQ7", "typed, present")
+
     s.close()
     return 0
 

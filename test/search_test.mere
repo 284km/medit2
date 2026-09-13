@@ -184,6 +184,47 @@ let c3 = Search.find_next_counted bb bsz 0 needle in
 let _ = check "a hit stops at the window it is in" (snd c3) 1;
 let _ = check "and is the straddling match" (fst (fst c3)) (page - half);
 
+// --- typing a needle costs ONE search, not one per keystroke ---------------
+// The reuse changes no answer, so every check above passes with it removed.
+// What it changes is how much gets read, and an incremental prompt re-searches
+// on every keystroke: typing five characters of a needle that is nowhere in a
+// 1 GB file read that file five times, 860 ms of it.
+//
+// So it is counted, the same way the wrap bound above is. This is the editor's
+// prompt loop spelled out -- ask `plan` where to resume, search from there
+// when it says to, remember the match for the next keystroke.
+let rec _type_cost = fn (text: str) -> fn (i: int) ->
+                     fn (prev: str) -> fn (found: bool) -> fn (at: int) ->
+                     fn (acc: int) ->
+  if i > str_len text then acc
+  else
+    let cur = substring text 0 i in
+    let pl = Search.plan prev found at cur 0 in
+    if not (fst pl) then _type_cost text (i + 1) cur false (0 - 1) acc
+    else
+      let r = Search.find_next_counted bb bsz (snd pl) cur in
+      let hit = fst (fst r) in
+      _type_cost text (i + 1) cur (hit >= 0) hit (acc + snd r);
+
+// What the same keystrokes cost with no reuse at all: a fresh search from the
+// cursor, every time. Kept as the other half of the comparison rather than as
+// a number in a comment -- a bound with nothing to compare against is a claim.
+let rec _naive_cost = fn (text: str) -> fn (i: int) -> fn (acc: int) ->
+  if i > str_len text then acc
+  else _naive_cost text (i + 1)
+         (acc + snd (Search.find_next_counted bb bsz 0 (substring text 0 i)));
+
+let absent = "ZZ-nowhere-ZZ";
+let _ = check "typing a needle that is nowhere reads the file once"
+          (_type_cost absent 1 "" true (0 - 1) 0) 2;
+let _ = check "where a search per keystroke reads it once per character"
+          (_naive_cost absent 1 0) (2 * str_len absent);
+
+// The same for a needle that IS there: the first keystroke pays, the rest
+// resume from the match and stop in the window holding it.
+let _ = check "typing a needle that is there also reads one window per key"
+          (_type_cost needle 1 "" true (0 - 1) 0) (str_len needle);
+
 let _ = file_close bf;
 
 // --- a needle longer than a window -----------------------------------------
@@ -200,6 +241,54 @@ let lb = Buffer.of_origin (Disk ((lf, lsz)));
 let _ = check "a needle longer than one window is found"
           (Search.forward lb lsz 0 longneedle) 4;
 let _ = file_close lf;
+
+// --- what an incremental search can reuse -----------------------------------
+// `plan` returns (search?, from). Typing a needle that is not in the file used
+// to cost one whole-file scan PER KEYSTROKE; these are the rules that make it
+// cost one in total.
+let p_first = Search.plan "" true (0 - 1) "z" 100;
+let _ = check_b "the first keystroke searches" (fst p_first) true;
+let _ = check "from the cursor" (snd p_first) 100;
+
+// A miss cannot become a hit by adding characters.
+let p_miss = Search.plan "zeb" false (0 - 1) "zebr" 100;
+let _ = check_b "extending a needle that matched nothing does not search"
+          (fst p_miss) false;
+
+// ...but only when the old needle is a PREFIX. A different needle is a new
+// question.
+let p_diff = Search.plan "zeb" false (0 - 1) "xyz" 100;
+let _ = check_b "a different needle searches again" (fst p_diff) true;
+let _ = check "from the cursor" (snd p_diff) 100;
+
+// Backspace shortens the needle, which can only ADD matches, so nothing
+// carries over -- not even from a miss.
+let p_back = Search.plan "zebra" false (0 - 1) "zebr" 100;
+let _ = check_b "backspacing after a miss searches again" (fst p_back) true;
+let _ = check "from the cursor" (snd p_back) 100;
+
+// A hit bounds the next one: every match of the longer needle is a match of
+// the shorter one, so the first cannot be before where the shorter one was.
+let p_hit = Search.plan "th" true 31 "the" 0;
+let _ = check_b "extending a needle that matched does search" (fst p_hit) true;
+let _ = check "but only from where the last match was" (snd p_hit) 31;
+
+// A hit with no recorded position falls back to the cursor rather than to 0.
+let p_nopos = Search.plan "th" true (0 - 1) "the" 7;
+let _ = check "no recorded match means start at the cursor" (snd p_nopos) 7;
+
+// The same text again is the same answer, from the same place.
+let p_same = Search.plan "the" true 31 "the" 0;
+let _ = check_b "an unchanged needle still searches" (fst p_same) true;
+let _ = check "from its own last match" (snd p_same) 31;
+
+// The rules have to agree with a search that starts over. Resuming from the
+// previous hit must find what a full search finds.
+let full1 = Search.find_next b n 0 "the" in
+let plan2 = Search.plan "the" true (fst full1) "the " 0;
+let resumed = Search.find_next b n (snd plan2) "the " in
+let fresh = Search.find_next b n 0 "the " in
+let _ = check "resuming lands where starting over lands" (fst resumed) (fst fresh);
 
 // --- report ----------------------------------------------------------------
 let nf = vec_len fails;

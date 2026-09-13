@@ -412,6 +412,77 @@ def scenario_search(binary):
     s.close()
 
 
+def scenario_search_incremental_reuse(binary):
+    """Typing a needle re-searches on every keystroke, and most of those
+    searches can be skipped.
+
+    Extending a needle can only shrink its matches, so a needle that matched
+    NOWHERE stays unmatched however many characters are added, and a needle
+    that matched at X cannot next match before X. Typing a five-character
+    needle that is not in a 1 GB file cost five whole-file scans -- 860 ms --
+    and now costs one.
+
+    What is checked here is that the shortcut does not change any ANSWER. The
+    discriminating case is BACKSPACE: it makes the needle shorter, which can
+    only ADD matches, so nothing carries over -- a reuse that applied there
+    would keep reporting "not found" for a needle that is right there.
+    """
+    path = "/tmp/medit2_incr.txt"
+    with open(path, "w") as f:
+        f.write("alpha\nbeta\ngamma\ndelta\n")
+
+    s = Session([binary, path])
+    s.wait_for("L1/5", timeout=6.0)
+
+    # WHILE A PROMPT IS OPEN THE STATUS LINE IS THE PROMPT. The line number is
+    # not on screen to read, so each of these types the needle, ACCEPTS it, and
+    # then looks at where the cursor ended up.
+    #
+    # Type "gamma" one character at a time: each keystroke resumes from the
+    # previous match, and the answer has to be the same as a fresh search.
+    s.send(CTRL_F)
+    for ch in b"gamma":
+        s.send(bytes([ch]), settle=0.3)
+    s.send(ENTER)
+    check("an incrementally typed needle lands on its match",
+          s.wait_for("L3/5", timeout=4.0), True)
+
+    # One more character and it matches nothing. The prompt says so while it is
+    # open, which is readable without accepting.
+    s.send(CTRL_F)
+    for ch in b"gammaX":
+        s.send(bytes([ch]), settle=0.3)
+    check("extending past the match says not found",
+          s.wait_for("not found", timeout=4.0), True)
+
+    # BACKSPACE. The needle shrinks back to one that does match, and a reuse
+    # that carried the miss across would still say not found.
+    s.send(BACKSPACE)
+    check("backspacing stops saying not found",
+          s.wait_for("not found", timeout=1.0), False)
+    s.send(ENTER)
+    check("and the needle that matches is found again",
+          s.wait_for("L3/5", timeout=4.0), True)
+
+    # A search that has to WRAP still says so -- after a resume the scan starts
+    # at the previous match rather than at the cursor, and reporting a wrap
+    # relative to THAT would say the file is shorter than it is.
+    s.send(CTRL_G)
+    s.send(b"4")
+    s.send(ENTER)
+    s.wait_for("L4/5", timeout=4.0)
+    s.send(CTRL_F)
+    for ch in b"alpha":
+        s.send(bytes([ch]), settle=0.3)
+    check("a search from below its only match wraps",
+          s.wait_for("wrapped", timeout=4.0), True)
+    s.send(ENTER)
+    check("and lands on it", s.wait_for("L1/5", timeout=4.0), True)
+
+    s.send(CTRL_Q)
+    s.close()
+
+
 def scenario_search_japanese(binary):
     """Backspace in the prompt removes a character, not a byte.
 
@@ -1163,6 +1234,71 @@ def _conf_home(name, body):
     return home
 
 
+def _gutter_width(screen):
+    """Width of the number column, read off the first numbered line drawn."""
+    for line in screen.split("\n"):
+        m = re.match(r"^(\s*\d+) ", line)
+        if m:
+            return len(m.group(1)) + 1
+    return None
+
+
+def scenario_idle_indexing(binary):
+    """What the editor does to a large file while nobody is touching it.
+
+    Two properties, one file, because both need an index that is INCOMPLETE in
+    the first frame and complete a moment later.
+
+    THE GUTTER MUST NOT MOVE. Its width used to come from the line count, which
+    the lazy index learns gradually -- so opening a large file and touching
+    nothing widened the gutter under the text as the count grew. Measured on
+    1 GB: 5 -> 7 -> 8 -> 9 columns, shifting every line of text sideways four
+    times. The width is now a bound from the file's size, known in frame one.
+
+    THE INDEXING MUST NOT DRIBBLE. It used to read one 8 MiB chunk per 250 ms
+    poll timeout, which made the rate the timeout rather than anything about
+    scanning -- 32 MB/s, so a 1 GB file took 32 SECONDS to learn its own line
+    count, and redrew 124 times getting there. The unit checked here is those
+    redraws: how many DISTINCT line counts the editor ever put on screen. It is
+    a count and not a duration on purpose, so the gate says the same thing on a
+    slow machine as on a fast one.
+    """
+    home = _conf_home("gutter", "line_numbers = true\n")
+    path = "/tmp/medit2_idle.txt"
+    lines = 800000                       # 64 MB: 8 chunks at the old rate
+    with open(path, "w") as f:
+        f.write(("x" * 79 + "\n") * lines)
+
+    s = Session([binary, path], env={"HOME": home})
+    s.wait_for("L1/", timeout=10.0)
+    first = s.screen()
+    w_first = _gutter_width(first)
+    check("the gutter is drawn in the first frame", w_first is not None, True)
+    # If the first frame already knew the count, this scenario would pass for
+    # a reason that has nothing to do with what it checks.
+    check("and the count in it is still approximate", "+" in first, True)
+
+    check("the count becomes exact",
+          s.wait_for("L1/%d" % (lines + 1), timeout=30.0), True)
+    settled = s.screen()
+    check("and drops its +", "%d+" % (lines + 1) in settled, False)
+
+    check("the gutter is the same width after indexing as before",
+          _gutter_width(settled), w_first)
+
+    # Every frame the editor ever drew is in `raw`, so this counts them all
+    # rather than sampling and hoping.
+    counts = set(re.findall(rb"L1/(\d+\+?)", s.raw))
+    check("the index is built in a burst, not a chunk per redraw",
+          len(counts) <= 4, True)
+    if len(counts) > 4:
+        print("    (drew %d distinct counts: %s)"
+              % (len(counts), sorted(c.decode() for c in counts)[:12]))
+
+    s.send(CTRL_Q)
+    s.close()
+
+
 def scenario_config(binary):
     """~/.medit2.toml: line numbers, tab width, and a rebound key."""
     home = _conf_home("ok", "line_numbers = true\ntabstop = 4\n\n"
@@ -1247,12 +1383,14 @@ def main():
     scenario_selection(binary)
     scenario_selection_replace(binary)
     scenario_invalid_utf8(binary)
+    scenario_search_incremental_reuse(binary)
     scenario_search_japanese(binary)
     scenario_emoji(binary)
     scenario_lazy_index(binary)
     scenario_ambiguous_width_probe(binary)
     scenario_word_movement(binary)
     scenario_redo(binary)
+    scenario_idle_indexing(binary)
     scenario_config(binary)
     scenario_config_esc(binary)
     scenario_config_broken(binary)

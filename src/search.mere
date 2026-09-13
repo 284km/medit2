@@ -143,6 +143,40 @@ module Search {
   let backward = fn (b: buf) -> fn (total: int) -> fn (before: int) -> fn (needle: str) ->
     backward_from b total 0 before needle;
 
+  // --- what an incremental search can reuse ---------------------------------
+  //
+  // A search prompt re-runs on every keystroke. Typing a five-character needle
+  // that is not in the file used to cost five whole-file scans -- 860 ms on
+  // 1 GB, measured through the real editor -- because each keystroke started
+  // over.
+  //
+  // It does not have to. EXTENDING A NEEDLE CAN ONLY SHRINK ITS MATCHES, and
+  // two things follow:
+  //
+  //   - if the shorter needle matched NOWHERE, the longer one cannot match
+  //     either. There is no scan to do.
+  //   - if the shorter needle's first match (in search order) was at `at`,
+  //     every match of the longer one is a match of the shorter one, so the
+  //     first is at or after `at`. The scan can start there instead of at the
+  //     cursor.
+  //
+  // Both need the previous needle to be a PREFIX of this one. Backspace makes
+  // the needle shorter, the match set larger, and neither rule holds -- that
+  // starts over.
+  //
+  // This is a decision, not a search, so it is a pure function with its own
+  // tests. Reached only through the editor's prompt it would be testable only
+  // by timing, and a rule this easy to get subtly wrong deserves better.
+  let plan = fn (prev_text: str) -> fn (prev_found: bool) -> fn (prev_at: int) ->
+             fn (text: str) -> fn (origin: int) ->
+    // Not an extension: the match set may have grown, so nothing carries over.
+    if not (str_starts_with text prev_text) then (true, origin)
+    // The previous needle matched nothing anywhere, and this one contains it.
+    else if str_len prev_text > 0 && not prev_found then (false, 0)
+    // The previous needle's first match bounds this one's.
+    else if prev_at >= 0 then (true, prev_at)
+    else (true, origin);
+
   // What the editor actually calls: search from the cursor, and if nothing is
   // found, WRAP. Returns (offset, wrapped) so the editor can say so -- an
   // editor that silently wraps makes you think the file is shorter than it is.

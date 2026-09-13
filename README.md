@@ -146,12 +146,20 @@ changing, which is the only number a person experiences.
 | a line, or a screen, of movement | 3.5 ms | 3.5 ms | 3.1 ms |
 | search, hit at the cursor | 3.5 ms | 3.5 ms | 3.2 ms |
 | search, whole file, no match | 34.6 ms | 147.7 ms | 149.2 ms |
+| **typing a 5-character needle that is nowhere** | 36 ms | **152 ms** | 154 ms |
 
 3.1 ms is the harness's own floor, so everything at that number is "faster
 than this can measure". **Startup does not depend on the size of the file**,
 and neither does any edit.
 
-It did, until these were measured. The four that moved:
+The last row is the one to read twice. A search prompt re-searches on every
+keystroke, so the cost of *typing* a needle is not the cost of searching for
+it. Per keystroke, on 1 GB, it is `138.8 3.6 3.5 3.0 3.5` — one scan, then
+nothing. The scans after the first are skipped rather than made fast: a needle
+that matched nowhere still matches nowhere with another character on the end,
+and a needle that matched at X cannot next match before X.
+
+It did, until these were measured. The seven that moved:
 
 | | before | after | why |
 |---|---|---|---|
@@ -160,15 +168,33 @@ It did, until these were measured. The four that moved:
 | undo, 1 GB | 730 ms | **3.2 ms** | so did an undo |
 | type at the top, 128 M lines | 57 ms | **3.4 ms** | every later line start was shifted |
 | search with no match, 1 GB | 278 ms | **148 ms** | the wrap re-read the whole file |
+| type a 5-character absent needle, 1 GB | 728 ms | **152 ms** | the prompt searched again on every key |
+| know the line count of 1 GB exactly | 32 s | **2.4 s** | idle indexing ran at the poll timeout |
 
 The index still costs **8 bytes per line** and the document is still never in
 memory: 208 MB indexed in full is 25.6 MB resident, 1 GB of 80-byte lines is
 104 MB. What changed is *when* that is paid. The whole index is built only by
 the three things that need the end of the file — an exact line count, a jump
-past what is known, and a jump to the last line — and in idle time, 8 MiB per
-tick, so the count becomes exact a few seconds after opening. Until it does,
-the status bar says `L3/108135+`: the `+` is the difference between a number
-and a claim.
+past what is known, and a jump to the last line — and in idle time. Until it
+is built, the status bar says `L3/108135+`: the `+` is the difference between
+a number and a claim.
+
+Idle indexing runs in **bursts**, not a chunk per redraw. It used to read
+8 MiB and go back to sleep for the 250 ms poll timeout, which made the rate
+the timeout — 32 MB/s, so 1 GB took **32 seconds** to learn its own line
+count, redrawing 124 times on the way. It now keeps scanning until the index
+is complete, a keystroke is waiting, or the burst has used its 200 ms slice,
+which is the same 1 GB in **2.4 seconds** and 6 redraws. The chunk is 1 MiB,
+so a keystroke arriving mid-burst waits well under a millisecond.
+
+**The line-number gutter takes its width from the file's size, not the line
+count.** The count is exactly what the lazy index does not know yet, so the
+obvious rule made the gutter grow under the text while the file sat there
+untouched: on 1 GB it went 5 → 7 → 8 → 9 columns and shifted every line
+sideways four times. A file of *n* bytes cannot hold more than *n* lines, so
+the digits of its size fit any line number it will ever show, and that is known
+in the first frame. It costs about two columns on ordinary text — the price of
+a gutter that holds still.
 
 Searching runs at **7.2 GB/s**, which is memory bandwidth rather than a loop.
 It was 548 MB/s until `bench/big.sh` was pointed at it: `str_index_of` in the
@@ -278,9 +304,9 @@ Three layers, because each catches what the others cannot:
 |---|---|
 | `test/buffer_test.mere` | the piece table, run against **both** an in-memory origin and a real file — the pure one is the oracle for the one that ships |
 | `test/lines_test.mere` | the line index, which is **lazy**: the seam where one page's scan meets the next, and what a truncation at an edit keeps. Neither is visible to the pty suite, whose files all fit in the first page |
-| `test/search_test.mere` | a match that straddles a 256 KiB window boundary, a needle longer than a window, and backward search returning the **last** match rather than the first |
+| `test/search_test.mere` | a match that straddles a 256 KiB window boundary, a needle longer than a window, and backward search returning the **last** match rather than the first. Also the two **cost** properties, which change no answer and so are counted rather than compared: a wrap reads each window once, and typing a needle costs one search rather than one per keystroke |
 | `test/lsp_test.mere` | the cases a working server never sends: a reply to a question the user moved on from, an `error` instead of a `result`, a frame split across two reads, and a server *request* whose id collides with ours |
-| `test/pty_drive.py` | a **real pty**: `tty_raw` is a no-op off-tty, `term_rows` answers -1 through a pipe, and IXON/ISIG only exist where there is a line discipline. Piped tests passed while Ctrl-Z did nothing at all |
+| `test/pty_drive.py` | a **real pty**: `tty_raw` is a no-op off-tty, `term_rows` answers -1 through a pipe, and IXON/ISIG only exist where there is a line discipline. Piped tests passed while Ctrl-Z did nothing at all. It is also the only layer that can watch the editor **with nobody touching it** — that the gutter does not move and the index does not dribble are properties of an idle editor, and its unit is redraws, not milliseconds, so the check says the same thing on a slow machine |
 | `bench/latency.py` | the gap between a keystroke and the screen changing, on a real pty. Everything above measures a part; this measures what a person waits for |
 | the same suite with `mere` on `PATH` | the language server end to end — a diagnostic arriving and clearing, hover, definition, completion, formatting, and the two encoding cases: **kanji** separates bytes from characters, and an **emoji** separates characters from UTF-16 units. Neither substitutes for the other |
 

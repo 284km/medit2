@@ -41,6 +41,7 @@ extern fn term_cols: unit -> int;
 
 // Already in the C backend's own runtime: readiness over any fd, and read/write
 // that are read(2)/write(2) rather than recv/send.
+extern fn now_ms: unit -> int;
 extern fn io_poll_new: int -> int;
 extern fn io_poll_add: int -> int -> int -> int;
 extern fn io_poll_del: int -> int -> int;
@@ -73,8 +74,11 @@ type promptkind = PSearch | PGoto | POpen;
 // matched nothing still says so. Without it the prompt showed "(not found)"
 // while you typed and then replaced it with the term on Enter, which reads as
 // if the search had succeeded.
+// `at` is where the last incremental attempt matched, or -1. It is what makes
+// the NEXT keystroke cheap: extending a needle can only shrink its matches, so
+// the next first match cannot be before this one. See `Search.plan`.
 type prompt = { kind: promptkind, text: str, origin: int, back: bool,
-                note: str, found: bool };
+                note: str, found: bool, at: int };
 
 // A buffer that is not on screen. It is `ed` minus everything that belongs to
 // the EDITOR rather than to a document -- the terminal size, the ambiguous
@@ -575,22 +579,45 @@ let do_find_prev = fn (st: ed) -> fn (needle: str) ->
 // Incremental: every keystroke searches from where the prompt OPENED, so
 // deleting a character walks the match back rather than leaving the cursor
 // stranded past it.
-let _incremental = fn (st: ed) -> fn (p: prompt) ->
+// `prev` is the prompt as it was BEFORE this keystroke. What it found decides
+// how much of this search can be skipped -- see `Search.plan`.
+let _incremental = fn (st: ed) -> fn (prev: prompt) -> fn (p: prompt) ->
   if str_eq p.text "" then move_to st p.origin
   else
-    let r = if p.back then Search.find_prev st.buf st.total (p.origin + str_len p.text) p.text
-            else Search.find_next st.buf st.total p.origin p.text in
-    let hit = fst r in
-    if hit < 0 then
-      ({ st | prompt = Some ({ p | note = "  (not found)", found = false } : prompt) } : ed)
+    let plan = Search.plan prev.text prev.found prev.at p.text p.origin in
+    if not (fst plan) then
+      // The shorter needle matched nowhere and this one contains it. No scan.
+      ({ st | prompt = Some ({ p | note = "  (not found)", found = false,
+                                   at = 0 - 1 } : prompt) } : ed)
     else
-      let st2 = move_to st hit in
-      ({ st2 | prompt = Some ({ p | note = if snd r then "  (wrapped)" else "",
-                                    found = true } : prompt) } : ed);
+      let from = snd plan in
+      let r = if p.back then Search.find_prev st.buf st.total (from + str_len p.text) p.text
+              else Search.find_next st.buf st.total from p.text in
+      let hit = fst r in
+      if hit < 0 then
+        ({ st | prompt = Some ({ p | note = "  (not found)", found = false,
+                                     at = 0 - 1 } : prompt) } : ed)
+      else
+        let st2 = move_to st hit in
+        // "wrapped" means it wrapped relative to where the SEARCH started,
+        // which after a resume is the previous match rather than the cursor.
+        // Reporting that as a wrap would tell you the file is shorter than it
+        // is, so the note is recomputed against the origin.
+        // `at` is where the NEXT keystroke resumes. Recording anything at or
+        // below this match would still be correct -- every match of a longer
+        // needle is a match of this one, so nothing between an earlier point
+        // and `hit` can match -- it would only re-read the span in between.
+        // A bound, then, not a guard: replacing `hit` with an earlier offset
+        // leaves every test green and costs reading. What it may not be is
+        // LATER than `hit`, which would skip matches; that is the direction
+        // `Search.plan` is tested in.
+        ({ st2 | prompt = Some ({ p | note = if hit < p.origin then "  (wrapped)" else "",
+                                      found = true, at = hit } : prompt) } : ed);
 
 let open_prompt = fn (st: ed) -> fn (k: promptkind) -> fn (back: bool) ->
   ({ st | prompt = Some (prompt { kind = k, text = "", origin = st.cur,
-                                  back = back, note = "", found = true } : prompt),
+                                  back = back, note = "", found = true,
+                                  at = 0 - 1 } : prompt),
           msg = "" } : ed);
 
 let close_prompt = fn (st: ed) -> ({ st | prompt = None } : ed);
@@ -679,15 +706,27 @@ let _tab_text = fn (st: ed) ->
   sp k "";
 
 // --- the line number gutter ------------------------------------------------
-// Its width is taken from the LAST line's number, not from the numbers on
-// screen: a gutter that widened as you scrolled past line 999 would shift
-// every line of text sideways in the middle of reading.
+// Its width is a BOUND taken from the file's size, not the line count.
+//
+// The count was the obvious source and it was wrong twice over. It is not
+// known at all until the index is complete, and the index now completes in
+// the background, so the width grew while the file sat there: opening 1 GB
+// and touching nothing, the gutter went 5 -> 7 -> 8 -> 9 columns and shifted
+// every line of text sideways four times, over 124 redraws nobody asked for.
+// The old comment promised exactly what the lazy index then broke.
+//
+// A file of `total` bytes cannot hold more than `total` lines, so the digits
+// of `total` fit any line number it will ever show. That is known in the
+// first frame and changes only when your own typing crosses a power of ten
+// in FILE SIZE. It costs about two columns on a file of 80-byte lines --
+// `digits(bytes) ~ digits(lines) + digits(bytes per line)` -- which is the
+// price of a gutter that holds still.
 let _digits = fn (n: int) ->
   let rec go = fn (x: int) -> fn (d: int) -> if x < 10 then d else go (x / 10) (d + 1) in
   go (if n < 1 then 1 else n) 1;
 
 let gutter_width = fn (st: ed) ->
-  if not st.numbers then 0 else _digits (Lines.count st.lines) + 1;
+  if not st.numbers then 0 else _digits st.total + 1;
 
 let _gutter = fn (st: ed) -> fn (l: int) -> fn (shown: bool) ->
   let w = gutter_width st in
@@ -1022,7 +1061,37 @@ let _ = io_poll_add poll 0 1;
 // is under one frame, and a 1 GB file finishes in the two minutes nobody
 // spends looking at the first screen. Raising it makes the count exact sooner
 // and makes the tick that does it visible.
-let idle_index_bytes = 8388608;
+// One chunk is the longest a keystroke can wait behind the idle indexer, so it
+// is small; the burst below is what makes the rate. 1 MiB scans in well under
+// a millisecond.
+let idle_index_bytes = 1048576;
+
+// How long a burst may run before the loop goes round again. Chosen to be one
+// tick's worth of work, so the tick keeps its period while the index builds:
+// the terminal size is re-read and the language server is serviced at the same
+// rate whether or not there is indexing to do.
+let idle_index_ms = 200;
+
+// Build index until there is a reason to stop. The poll with a zero timeout is
+// the reason that matters: it asks "is there a keystroke waiting" without
+// waiting itself, and poll(2) is level-triggered, so discarding the answer
+// here costs nothing -- the wait at the top of the loop is told the same thing
+// again.
+//
+// TWO OF THE THREE CONDITIONS ARE BOUNDS, NOT GUARDS, and the poison run says
+// so: removing the poll or the deadline leaves every test green. Neither can
+// change an answer, because indexing changes no document -- they decide how
+// long something else waits. The poll bounds a keystroke's wait at one chunk;
+// the deadline bounds the terminal-size check and the language-server tick at
+// one burst. Only the third, `complete`, is load-bearing, and removing it is
+// an infinite loop rather than a wrong answer.
+let rec _index_idle = fn (st: ed) -> fn (deadline: int) ->
+  if Lines.complete st.lines st.total then st
+  else if io_poll_wait poll 0 > 0 then st
+  else if now_ms () >= deadline then st
+  else _index_idle ({ st | lines = Lines.extend st.buf st.lines st.total
+                                     (Lines.covered st.lines + idle_index_bytes) } : ed)
+                   deadline;
 
 // --- buffers ---------------------------------------------------------------
 
@@ -1164,7 +1233,7 @@ let prompt_key = fn (st: ed) -> fn (p: prompt) -> fn (c: int) ->
     // Only a search runs as you type. A file is opened when you say so: a
     // prompt that opened `/e`, `/et`, `/etc` on the way to `/etc/hosts` would
     // open three buffers for one file.
-    (match p.kind with PSearch -> _incremental st2 p2 | PGoto -> st2 | POpen -> st2)
+    (match p.kind with PSearch -> _incremental st2 p p2 | PGoto -> st2 | POpen -> st2)
   else st;
 
 // Printable text typed into the prompt, as a run.
@@ -1172,7 +1241,7 @@ let prompt_text = fn (st: ed) -> fn (p: prompt) -> fn (s: str) ->
   let t = p.text ++ s in
   let p2 = ({ p | text = t, note = "", found = true } : prompt) in
   let st2 = ({ st | prompt = Some p2 } : ed) in
-  match p.kind with PSearch -> _incremental st2 p2 | PGoto -> st2 | POpen -> st2;
+  match p.kind with PSearch -> _incremental st2 p p2 | PGoto -> st2 | POpen -> st2;
 
 // --- asking the language server -------------------------------------------
 
@@ -1714,14 +1783,22 @@ let rec loop = fn (st: ed) ->
       // The highlighting is re-asked for on the same tick the change is sent,
       // which is the only moment the server and the buffer agree.
       let st = if st.toks_stale then ask_tokens st else st in
-      // Idle time is when the rest of the index gets built. A chunk per tick,
-      // not the whole tail: the editor has to be ready for the next keystroke,
-      // and a person who opens a 1 GB file and starts typing should never wait
-      // for a scan they did not ask for. What this buys is an exact line count
-      // and an instant jump to the end, a few seconds after opening.
-      let st = if Lines.complete st.lines st.total then st
-               else ({ st | lines = Lines.extend st.buf st.lines st.total
-                                      (Lines.covered st.lines + idle_index_bytes) } : ed) in
+      // Idle time is when the rest of the index gets built. What this buys is
+      // an exact line count and an instant jump to the end.
+      //
+      // This used to read ONE chunk and go back to sleep for 250 ms, which
+      // made the rate the poll timeout rather than anything about scanning:
+      // 8 MiB per tick is 32 MB/s, and a 1 GB file took 32 SECONDS to learn
+      // its own line count -- measured, with the status bar's `+` as the
+      // clock. Nothing was waiting; the editor was.
+      //
+      // So it now keeps going until one of three things stops it: the index
+      // is complete, something arrived to read, or the burst has had its
+      // slice. The first is the goal, the second is why a person who opens a
+      // 1 GB file and starts typing never waits for a scan they did not ask
+      // for, and the third is what keeps the resize check and the server tick
+      // running at their own rate.
+      let st = _index_idle st (now_ms () + idle_index_ms) in
       let r = term_rows () in
       let c = term_cols () in
       if r > 0 && (r != st.rows || c != st.cols) then
