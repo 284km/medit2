@@ -46,11 +46,63 @@ guessing.
 | | |
 |---|---|
 | arrows | move; left/right step by **grapheme cluster** — not a byte, and not a code point |
-| printable text | insert — a paste arrives as one edit and one undo step |
-| Enter / Backspace | as expected; backspace removes a whole cluster |
-| Ctrl-S | save |
-| Ctrl-Z | undo |
-| Ctrl-Q | quit |
+| Shift+arrows | extend the selection; an unshifted arrow drops it |
+| printable text | insert — a paste arrives as one edit and one undo step. With a selection, replaces it |
+| Enter / Backspace | as expected; backspace removes a whole cluster, or the selection |
+| Ctrl-A | start a selection at the cursor |
+| Ctrl-W / Ctrl-K / Ctrl-Y | copy / cut / paste — through `pbcopy`/`xclip` when there is one, and internally when there is not |
+| Ctrl-F / Ctrl-R | search forward / backward, incrementally, over the piece table — 208 MB in 0.46 s at 2.3 MB resident |
+| Ctrl-N / Ctrl-P | the next / previous match, wrapping, and it says when it wrapped |
+| Ctrl-G | go to line |
+| Ctrl-T | the type under the cursor (hover) |
+| Ctrl-D / Ctrl-B | go to the definition / come back |
+| Ctrl-Space | completion; the menu narrows as you keep typing, Enter or Tab takes it |
+| Ctrl-L | format the file through the server |
+| Ctrl-Left / Ctrl-Right | move by word; with Shift, select by word. Word motion stops at a line end, so selecting the last word and deleting it does not join two lines |
+| Ctrl-X / Ctrl-O / Ctrl-U | next buffer / open a file / close this buffer |
+| Ctrl-S / Ctrl-Z / Ctrl-E / Ctrl-Q | save / undo / redo / quit |
+| Esc | close a popup, or cancel a prompt |
+
+Undo restores the **cursor** as well as the text: typing `X` at the start of
+`base` and undoing puts the next character back at offset 0, not at offset 1.
+The position rides on the undo stack itself rather than in a parallel one in
+the editor, because a parallel stack has to be pushed in exactly the same
+places and the first edit that forgets desynchronises them silently.
+
+## Configuration
+
+`~/.medit2.toml`, if it is there. A config with a mistake in it costs you the
+line with the mistake and a message saying so, never the editor: one you cannot
+start is one you cannot fix the dotfile with.
+
+```toml
+wide = true          # this terminal draws EastAsianWidth=Ambiguous as 2 columns
+tabstop = 4          # Tab inserts spaces to the next multiple of this
+line_numbers = true
+
+[color]              # SGR numbers, by the server's token-type NAME
+keyword = "35"
+comment = "90"
+
+[keys]               # any action, on any control byte
+save = "C-s"
+redo = "C-e"
+complete = "C-space"
+```
+
+Rebinding an action to a key another action already had is allowed and is
+**reported**: the action that lost it now has no key at all, and finding that
+out by pressing it is the worst way to find out. `Esc` is refused by name --
+it is the first byte of every arrow key, so binding an action to it would make
+arrows do that action whenever the read happened to split there.
+
+Without a config, `--wide` decides; without that, the editor **asks the
+terminal**: it prints one ambiguous-width character and reads the cursor
+position back with `ESC[6n`. That is a measurement of this terminal rather than
+a guess from `$LANG`, which says what language you read and nothing about how
+the emulator draws. The probe reads the keyboard's descriptor, so it cuts its
+own answer out of what it read and hands the rest back to the editor -- the
+first version swallowed a keystroke typed during startup.
 
 ## How it does not load the file
 
@@ -117,6 +169,48 @@ overlap, and it does not pretend they do.
 `didChange` is sent when the editor goes **idle**, not per keystroke, for the
 same reason.
 
+Hover, go-to-definition, completion and formatting all go over the same
+connection. One request is outstanding at a time and it is correlated by id: a
+reply carrying a previous id is dropped, because the user has already moved on
+from the position it is about. An unanswered request is given up on after three
+seconds rather than leaving the editor waiting for an answer that is not coming.
+
+Two things this found in `mere lsp`, neither of which any test written from the
+specification would have produced:
+
+- **its columns were bytes.** The protocol counts UTF-16 code units. Every test
+  was ASCII, where the two numbers are equal; one line with kanji on it put the
+  question six columns to the left, and the server answered about that token
+  instead — correctly, and about the wrong thing. Fixed in `lib/lsp.ml`, in both
+  directions, and for diagnostics and semantic tokens as well as for hover.
+- **completion could not offer a builtin.** `str_len` and `print` are not
+  declarations, so the scope walk that reads the tree could not see them. Typing
+  `str_l` and asking for completion offered `list_iter`.
+
+Completion is filtered by the client, which is what the server's
+`isIncomplete: false` asks for: it returns the whole visible scope once, and the
+menu narrows as you keep typing with no second round trip.
+
+## Syntax highlighting
+
+From the server's semantic tokens, so there is no second lexer in here
+pretending to know Mere. `mere lsp` says which names are **parameters** and
+which are **functions** -- a distinction no pattern over the text can make --
+and, since v0.1.478, where the keywords, literals and comments are, taken from
+the compiler's own lexer. An editor that coloured only the identifiers and left
+`let`, `"text"` and the comments plain does not look like it is highlighting
+anything, so that half was added to the server rather than guessed at here.
+
+A token's start is in UTF-16 units from the start of its line and the row on
+screen is bytes, so the two are converted per row. Three kanji put nine bytes
+where the protocol counts three; opening the colour at the byte offset would
+split a character and corrupt every column after it.
+
+The colours refresh themselves. It is the one request the editor makes without
+anyone pressing a key -- which is also why it will not make it while a hover or
+a completion menu is open: asking clears the pending answer, and the popup you
+were reading would vanish.
+
 ## Tests
 
 ```sh
@@ -128,12 +222,28 @@ Three layers, because each catches what the others cannot:
 | | what it can see |
 |---|---|
 | `test/buffer_test.mere` | the piece table, run against **both** an in-memory origin and a real file — the pure one is the oracle for the one that ships |
+| `test/search_test.mere` | a match that straddles a 256 KiB window boundary, a needle longer than a window, and backward search returning the **last** match rather than the first |
+| `test/lsp_test.mere` | the cases a working server never sends: a reply to a question the user moved on from, an `error` instead of a `result`, a frame split across two reads, and a server *request* whose id collides with ours |
 | `test/pty_drive.py` | a **real pty**: `tty_raw` is a no-op off-tty, `term_rows` answers -1 through a pipe, and IXON/ISIG only exist where there is a line discipline. Piped tests passed while Ctrl-Z did nothing at all |
-| the same suite with `mere` on `PATH` | the language server end to end — a diagnostic arriving, and clearing when the file is fixed |
+| the same suite with `mere` on `PATH` | the language server end to end — a diagnostic arriving and clearing, hover, definition, completion, formatting, and the two encoding cases: **kanji** separates bytes from characters, and an **emoji** separates characters from UTF-16 units. Neither substitutes for the other |
 
 The pty suite waits for the thing it is about to assert on rather than for a
 duration, so it is not a race; and every scenario has been checked to fail when
 the behaviour it names is broken.
+
+Four of those checks did not fail the first time they were poisoned, and each
+one was a defect in the test rather than in the editor:
+
+- a poison that did not **compile** looked green
+- a poison that did not change **behaviour** looked green — the discriminating
+  input had to become a server-sent *request*, whose id collides with the
+  client's on the first question each side asks
+- "the completion menu opened" waited for `str_len`, and **that word was
+  already on line 1**; it waits for the popup's own gutter now
+- "positions are sent as characters" passed with byte offsets, because **every
+  test file was ASCII**. Kanji separate bytes from characters and an emoji
+  separates characters from UTF-16 units; both are now scenarios, and neither
+  substitutes for the other
 
 ## Why it exists
 

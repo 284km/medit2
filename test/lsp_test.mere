@@ -1,0 +1,271 @@
+// test/lsp_test.mere — the request/response half of the language-server client.
+//
+// Run: mere test/lsp_test.mere
+//
+// Headless on purpose. Driving a real `mere lsp` proves the two programs can
+// talk; it does NOT exercise the cases this layer exists for, because a working
+// server never sends them:
+//
+//   - a reply to a question the user has already moved on from (stale id)
+//   - an `error` object instead of a `result`
+//   - a `null` result, which is how "I have no answer" is spelled
+//   - a frame split across two reads
+//   - a notification arriving while a request is in flight
+//
+// The result shapes are unions in the protocol (`Location | Location[] |
+// LocationLink[]`, `CompletionItem[] | CompletionList`), so each is fed in
+// BOTH spellings. Accepting only the one `mere lsp` happens to send would be a
+// client that works with exactly one server.
+
+import "../src/lsp.mere";
+
+let fails = vec_new ();
+
+let check = fn (name: str) -> fn (got: str) -> fn (want: str) ->
+  if str_eq got want then ()
+  else vec_push fails (name ++ ": got <" ++ got ++ "> want <" ++ want ++ ">");
+
+let rec _join = fn (xs: str list) -> fn (acc: str) ->
+  match xs with
+  | Nil -> acc
+  | Cons (x, r) -> _join r (if str_eq acc "" then x else acc ++ "," ++ x);
+
+let rec _join_ints = fn (xs: int list) -> fn (acc: str) ->
+  match xs with
+  | Nil -> acc
+  | Cons (x, r) -> _join_ints r (if str_eq acc "" then show x else acc ++ "," ++ show x);
+
+let rec _count = fn (xs: tedit list) -> fn (n: int) ->
+  match xs with Nil -> n | Cons (_, r) -> _count r (n + 1);
+
+// One printable line per answer, so a mismatch says what came back rather than
+// which constructor it was.
+let show_ans = fn (a: answer) ->
+  match a with
+  | ANone -> "none"
+  | AHover (t) -> "hover:" ++ t
+  | ADef (u, l, c) -> "def:" ++ u ++ ":" ++ show l ++ ":" ++ show c
+  | ACompl (ls) -> "compl:" ++ _join ls ""
+  | AEdits (es) ->
+    (match es with
+     | Cons (e, _) -> "edits:" ++ show (_count es 0) ++ ":" ++ show e.sl ++ ":"
+                   ++ show e.sc ++ "-" ++ show e.el ++ ":" ++ show e.ec ++ ":" ++ e.text
+     | Nil -> "edits:0")
+  // Semantic tokens are four absolute numbers per token, decoded from the
+  // protocol's deltas. Printed flat, because that is how they are stored.
+  | ATokens (ns) -> "toks:" ++ _join_ints ns "";
+
+// A response body with whatever `result` spelling the case is about. The id is
+// 1 because each case starts from a fresh connection and asks once.
+let resp = fn (id: int) -> fn (result: str) ->
+  "\{\"jsonrpc\":\"2.0\",\"id\":" ++ show id ++ ",\"result\":" ++ result ++ "}";
+
+// Ask, then answer: returns the state after the reply has been consumed.
+let ask_answer = fn (w: want) -> fn (result: str) ->
+  let st = Lsp.connect (0 - 1) in
+  let r = Lsp.request st "/tmp/x.mere" "textDocument/hover" "" w in
+  Lsp.feed (snd r) (Lsp.frame (resp 1 result));
+
+let ans = fn (w: want) -> fn (result: str) -> show_ans (ask_answer w result).answer;
+
+// --- hover -----------------------------------------------------------------
+let _ = check "hover, MarkupContent"
+          (ans WHover "\{\"contents\":\{\"kind\":\"markdown\",\"value\":\"int -> int\"}}")
+          "hover:int -> int";
+let _ = check "hover, a bare string"
+          (ans WHover "\{\"contents\":\"str\"}") "hover:str";
+let _ = check "hover, an array of MarkedString"
+          (ans WHover "\{\"contents\":[\{\"language\":\"mere\",\"value\":\"bool\"}]}")
+          "hover:bool";
+let _ = check "hover, null is no answer" (ans WHover "null") "none";
+// Whitespace around a hover would push the status bar around for nothing.
+let _ = check "hover is trimmed"
+          (ans WHover "\{\"contents\":\{\"value\":\"  int  \"}}") "hover:int";
+
+// --- definition ------------------------------------------------------------
+let loc = "\{\"uri\":\"file:///a.mere\",\"range\":\{\"start\":\{\"line\":4,\"character\":7},"
+       ++ "\"end\":\{\"line\":4,\"character\":9}}}";
+let _ = check "definition, a Location" (ans WDefinition loc) "def:file:///a.mere:4:7";
+let _ = check "definition, a Location[]" (ans WDefinition ("[" ++ loc ++ "]"))
+          "def:file:///a.mere:4:7";
+let _ = check "definition, a LocationLink[]"
+          (ans WDefinition ("[\{\"targetUri\":\"file:///b.mere\",\"targetSelectionRange\":"
+            ++ "\{\"start\":\{\"line\":2,\"character\":0},\"end\":\{\"line\":2,\"character\":3}}}]"))
+          "def:file:///b.mere:2:0";
+let _ = check "definition, an empty array is no answer" (ans WDefinition "[]") "none";
+let _ = check "definition, null is no answer" (ans WDefinition "null") "none";
+
+// --- completion ------------------------------------------------------------
+let _ = check "completion, a CompletionItem[]"
+          (ans WComplete "[\{\"label\":\"map\"},\{\"label\":\"max\"}]") "compl:map,max";
+let _ = check "completion, a CompletionList"
+          (ans WComplete "\{\"isIncomplete\":false,\"items\":[\{\"label\":\"filter\"}]}")
+          "compl:filter";
+// Order is the server's ranking; reversing it would put the worst match first.
+let _ = check "completion keeps the server's order"
+          (ans WComplete "[\{\"label\":\"z\"},\{\"label\":\"a\"}]") "compl:z,a";
+let _ = check "completion, empty is no answer" (ans WComplete "[]") "none";
+
+// --- formatting ------------------------------------------------------------
+let _ = check "formatting, a TextEdit[]"
+          (ans WFormat ("[\{\"range\":\{\"start\":\{\"line\":0,\"character\":0},"
+            ++ "\"end\":\{\"line\":1,\"character\":2}},\"newText\":\"let x = 1\"}]"))
+          "edits:1:0:0-1:2:let x = 1";
+let _ = check "formatting, no edits means nothing to do" (ans WFormat "[]") "none";
+
+// --- semantic tokens -------------------------------------------------------
+// Five integers per token and EVERY ONE IS A DELTA: the line from the previous
+// token's line, and the character from the previous token's character WHEN
+// THEY SHARE A LINE. Decoding it wrong paints the file at an offset that
+// GROWS, which reads as the highlighting drifting rather than as a decoding
+// bug -- so the cases below are chosen to separate the two rules.
+let _ = check "tokens, one token"
+          (ans WTokens "\{\"data\":[0,4,3,1,0]}") "toks:0,4,3,1";
+// Same line: the character is a delta from the previous character.
+let _ = check "a second token on the same line adds to the character"
+          (ans WTokens "\{\"data\":[0,4,3,1,0, 0,5,2,0,0]}") "toks:0,4,3,1,0,9,2,0";
+// New line: the character is ABSOLUTE again. Adding here is the bug that
+// looks like drift.
+//
+// The FIRST token is deliberately not on line 0. With everything starting at
+// line 0, "line + delta" and "delta" give the same answer for the second token
+// too, and a decoder that forgot to accumulate would pass -- the line rule
+// would be untested by a test named for it.
+let _ = check "a token on a new line restarts the character"
+          (ans WTokens "\{\"data\":[3,4,3,1,0, 2,1,2,0,0]}") "toks:3,4,3,1,5,1,2,0";
+let _ = check "no tokens is no answer" (ans WTokens "\{\"data\":[]}") "none";
+// A stream that is not a multiple of five is one this client cannot read.
+// Keeping what was decoded beats guessing at the rest.
+let _ = check "a truncated stream keeps what it decoded"
+          (ans WTokens "\{\"data\":[0,4,3,1,0, 0,5]}") "toks:0,4,3,1";
+
+// The legend comes from the initialize reply: a token's kind is an INDEX into
+// it and means nothing without it.
+let inited =
+  let st = Lsp.connect (0 - 1) in
+  let h = Lsp.hello st "/tmp/x.mere" "let a = 1;" in
+  Lsp.feed (snd h) (Lsp.frame (resp 1
+    ("\{\"capabilities\":\{\"semanticTokensProvider\":\{\"legend\":"
+     ++ "\{\"tokenTypes\":[\"function\",\"keyword\"]}}}}")));
+let _ = check "the legend is taken from the handshake"
+          (_join (inited.legend) "") "function,keyword";
+let _ = check "and the handshake is not reported as an answer" inited.note "";
+let _ = check "nor does it leave one" (show_ans inited.answer) "none";
+
+// --- correlation -----------------------------------------------------------
+// A reply carrying a previous id is about a position the user has left. The
+// question in flight must stay in flight.
+let stale =
+  let st = Lsp.connect (0 - 1) in
+  let r1 = Lsp.request st "/tmp/x.mere" "textDocument/hover" "" WHover in
+  let r2 = Lsp.request (snd r1) "/tmp/x.mere" "textDocument/hover" "" WHover in
+  Lsp.feed (snd r2) (Lsp.frame (resp 1 "\{\"contents\":\"stale\"}"));
+let _ = check "a stale id is ignored" (show_ans stale.answer) "none";
+let _ = check "and the request is still in flight"
+          (match stale.req_want with | WNone -> "cleared" | _ -> "pending") "pending";
+
+let fresh = Lsp.feed stale (Lsp.frame (resp 2 "\{\"contents\":\"fresh\"}"));
+let _ = check "the current id is taken" (show_ans fresh.answer) "hover:fresh";
+let _ = check "and clears the in-flight request"
+          (match fresh.req_want with | WNone -> "cleared" | _ -> "pending") "cleared";
+
+// --- errors ----------------------------------------------------------------
+let err =
+  let st = Lsp.connect (0 - 1) in
+  let r = Lsp.request st "/tmp/x.mere" "textDocument/hover" "" WHover in
+  Lsp.feed (snd r) (Lsp.frame ("\{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":"
+    ++ "\{\"code\":-32601,\"message\":\"unknown method\"}}"));
+let _ = check "an error is shown, not swallowed" err.note "lsp error: unknown method";
+let _ = check "and leaves no answer" (show_ans err.answer) "none";
+
+// --- framing ---------------------------------------------------------------
+// A frame split across reads is the normal case on a socket, not an edge one.
+let split =
+  let st = Lsp.connect (0 - 1) in
+  let r = Lsp.request st "/tmp/x.mere" "textDocument/hover" "" WHover in
+  let full = Lsp.frame (resp 1 "\{\"contents\":\"halves\"}") in
+  let cut = 12 in
+  let a = Lsp.feed (snd r) (substring full 0 cut) in
+  (a, Lsp.feed a (substring full cut (str_len full)));
+let _ = check "half a frame answers nothing yet" (show_ans (fst split).answer) "none";
+let _ = check "the second half completes it" (show_ans (snd split).answer) "hover:halves";
+
+// Two frames in one read must both be consumed -- a server that answers and
+// then publishes diagnostics writes them back to back.
+let both =
+  let st = Lsp.connect (0 - 1) in
+  let r = Lsp.request st "/tmp/x.mere" "textDocument/hover" "" WHover in
+  Lsp.feed (snd r)
+    (Lsp.frame (resp 1 "\{\"contents\":\"first\"}")
+     ++ Lsp.frame ("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\","
+       ++ "\"params\":\{\"uri\":\"file:///a\",\"diagnostics\":[\{\"range\":\{\"start\":"
+       ++ "\{\"line\":6,\"character\":0},\"end\":\{\"line\":6,\"character\":1}},"
+       ++ "\"message\":\"boom\"}]}}"));
+let _ = check "both frames in one read are consumed" (show_ans both.answer) "hover:first";
+let _ = check "the notification is applied too" both.diag "L7: boom";
+
+// A notification arriving while a request is in flight must not answer it.
+// The method is one this client does NOT handle, on purpose: a notification it
+// recognises would be caught by its own branch, and the property under test is
+// what happens to everything else -- a server is free to send `window/logMessage`
+// at any time, and taking it for the answer would resolve the hover with
+// nothing in it.
+let notif_only =
+  let st = Lsp.connect (0 - 1) in
+  let r = Lsp.request st "/tmp/x.mere" "textDocument/hover" "" WHover in
+  Lsp.feed (snd r) (Lsp.frame ("\{\"jsonrpc\":\"2.0\",\"method\":"
+    ++ "\"window/logMessage\",\"params\":\{\"type\":3,\"message\":\"hi\"}}"));
+let _ = check "a notification does not resolve a request"
+          (match notif_only.req_want with | WNone -> "cleared" | _ -> "pending") "pending";
+
+// A server may send a REQUEST of its own -- `workspace/configuration`,
+// `window/showMessageRequest`. Those carry BOTH a method and an id, and the
+// server's id counter starts at 1 just like the client's, so the ids collide
+// on the first question each side asks. Deciding "has an id, therefore it is
+// my answer" resolves a hover with the server's question.
+let server_request =
+  let st = Lsp.connect (0 - 1) in
+  let r = Lsp.request st "/tmp/x.mere" "textDocument/hover" "" WHover in
+  Lsp.feed (snd r) (Lsp.frame ("\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":"
+    ++ "\"workspace/configuration\",\"params\":\{\"items\":[]}}"));
+let _ = check "a server request is not read as our answer"
+          (match server_request.req_want with | WNone -> "cleared" | _ -> "pending") "pending";
+let _ = check "and leaves the answer empty" (show_ans server_request.answer) "none";
+
+// --- garbage ---------------------------------------------------------------
+// A server is allowed to send something this client cannot parse. Dying on it
+// would be worse than ignoring it, so the state must survive unchanged.
+let junk =
+  let st = Lsp.connect (0 - 1) in
+  let r = Lsp.request st "/tmp/x.mere" "textDocument/hover" "" WHover in
+  Lsp.feed (snd r) (Lsp.frame "\{not json at all");
+let _ = check "unparseable JSON leaves the request in flight"
+          (match junk.req_want with | WNone -> "cleared" | _ -> "pending") "pending";
+
+// --- timeout ---------------------------------------------------------------
+// `tick` gives up on an unanswered request. Nothing here sleeps: the state is
+// built with a send time far in the past, which is the same state the clock
+// would have produced.
+let timed_out =
+  let st = Lsp.connect (0 - 1) in
+  let r = Lsp.request st "/tmp/x.mere" "textDocument/hover" "" WHover in
+  Lsp.tick ({ (snd r) | req_at = 0 - 1000000 } : lsp);
+let _ = check "an unanswered request is given up on" timed_out.note "lsp: no answer";
+let _ = check "and stops being in flight"
+          (match timed_out.req_want with | WNone -> "cleared" | _ -> "pending") "cleared";
+
+// A request that has NOT aged out must be left alone -- a tick that clears
+// every request would make the editor answer "no answer" to everything.
+let still_waiting =
+  let st = Lsp.connect (0 - 1) in
+  let r = Lsp.request st "/tmp/x.mere" "textDocument/hover" "" WHover in
+  Lsp.tick (snd r);
+let _ = check "a fresh request survives a tick"
+          (match still_waiting.req_want with | WNone -> "cleared" | _ -> "pending") "pending";
+
+// --- report ----------------------------------------------------------------
+let nf = vec_len fails;
+let rec report = fn (i: int) ->
+  if i >= nf then () else let _ = print ("FAIL " ++ vec_get fails i) in report (i + 1);
+let _ = report 0;
+print (if nf == 0 then "lsp: all ok" else "lsp: " ++ show nf ++ " FAILED")

@@ -35,6 +35,23 @@ clang -O2 /tmp/medit2_buffer_test.c -o /tmp/medit2_buffer_test 2>/dev/null
 /tmp/medit2_buffer_test | tail -3
 /tmp/medit2_buffer_test | grep -q "buffer: all ok" || fails=$((fails + 1))
 
+# --- 1b. search ------------------------------------------------------------
+# Headless, because the interesting cases are about offsets and window
+# boundaries rather than about the screen: a match that straddles a 256 KiB
+# boundary, a needle longer than a window, and backward search returning the
+# LAST match rather than the first.
+step "search"
+"$MERE" test/search_test.mere | tail -2
+"$MERE" test/search_test.mere | grep -q "search: all ok" || fails=$((fails + 1))
+
+# --- 1c. the language-server client ----------------------------------------
+# Headless, because the cases this layer exists for are the ones a working
+# server never sends: a stale id, an error object, a split frame, a server
+# request whose id collides with ours.
+step "lsp client"
+"$MERE" test/lsp_test.mere | tail -2
+"$MERE" test/lsp_test.mere | grep -q "lsp: all ok" || fails=$((fails + 1))
+
 # --- 2. build the editor ---------------------------------------------------
 step "build"
 "$MERE" -c medit2.mere > medit2.c

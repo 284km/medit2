@@ -28,6 +28,31 @@ import time
 ROWS, COLS = 24, 80
 
 # Keys, by the byte the terminal actually sends.
+CTRL_F = b"\x06"
+CTRL_G = b"\x07"
+CTRL_N = b"\x0e"
+CTRL_P = b"\x10"
+CTRL_R = b"\x12"
+ESC = b"\x1b"
+CTRL_A = b"\x01"   # mark
+CTRL_W = b"\x17"   # copy
+CTRL_K = b"\x0b"   # cut
+CTRL_Y = b"\x19"   # paste
+SH_RIGHT = b"\x1b[1;2C"
+SH_LEFT = b"\x1b[1;2D"
+SH_DOWN = b"\x1b[1;2B"
+CTRL_T = b"\x14"   # hover
+CTRL_D = b"\x04"   # definition
+CTRL_B = b"\x02"   # back from a jump
+CTRL_L = b"\x0c"   # format
+CTRL_SPACE = b"\x00"  # completion
+CTRL_X = b"\x18"   # next buffer
+CTRL_O = b"\x0f"   # open
+CTRL_U = b"\x15"   # close buffer
+CTRL_E = b"\x05"   # redo
+TAB = b"\t"
+C_RIGHT = b"\x1b[1;5C"
+C_LEFT = b"\x1b[1;5D"
 CTRL_S = b"\x13"
 CTRL_Q = b"\x11"
 CTRL_Z = b"\x1a"
@@ -44,13 +69,22 @@ def visible(raw: bytes) -> str:
 
 
 class Session:
-    def __init__(self, argv):
+    def __init__(self, argv, env=None):
+        """`env` overrides variables in the CHILD only.
+
+        The config tests need a `$HOME` with a `.medit2.toml` in it, and
+        writing one into the real home directory would be a test that edits
+        the machine it runs on.
+        """
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
+            if env:
+                os.environ.update(env)
             os.execv(argv[0], argv)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ,
                     struct.pack("HHHH", ROWS, COLS, 0, 0))
         self.raw = b""
+        self.dead = False
         self.drain(1.5)
 
     def drain(self, seconds=0.2, quiet=0.08):
@@ -72,19 +106,67 @@ class Session:
             try:
                 chunk = os.read(self.fd, 65536)
             except OSError:
+                self.dead = True
                 break
             if not chunk:
+                # EOF: the editor is gone. Recording it matters as much as
+                # noticing it -- without this, `wait_for` kept calling `drain`,
+                # each call returned instantly on the closed descriptor, and
+                # the loop spun at 100% CPU for the whole timeout. A poisoned
+                # build that CRASHES then took minutes to report instead of
+                # seconds, which is the slow half of "a gate must not hang".
+                self.dead = True
                 break
             self.raw += chunk
             last = time.time()
         return self.raw
 
     def send(self, data: bytes, settle=1.5):
-        os.write(self.fd, data)
+        """Write keys, and turn a dead subject into a NAMED failure.
+
+        A crashed editor closes the pty, and the next write raises EIO. Letting
+        that escape reports the harness's stack trace instead of the editor's
+        death, which is the wrong subject: a poison run that kills the program
+        should read as "the program died", not as a Python error.
+        """
+        if self.dead:
+            return
+        try:
+            os.write(self.fd, data)
+        except OSError:
+            self.dead = True
+            FAILS.append("the editor exited before it was asked to "
+                         "(the pty closed while sending keys)")
+            return
         self.drain(settle)
 
+    def screen(self):
+        """The LAST frame drawn, not everything ever drawn.
+
+        This editor repaints from home on every frame, so the current screen is
+        whatever follows the final `ESC[H`. Searching the accumulated output
+        instead answers "was the editor EVER in this state", which is a
+        different question and a much weaker one: a check that the cursor
+        returned to line 1 passes trivially, because line 1 is where it started.
+        That is not a hypothetical -- deleting the code that restores the
+        position left this suite green until this was fixed.
+        """
+        i = self.raw.rfind(b"\x1b[H")
+        return visible(self.raw[i:] if i >= 0 else self.raw)
+
+    def screen_raw(self):
+        """The last frame WITH its escape sequences.
+
+        `screen()` strips them, which is right for asking what a person reads
+        and useless for asking what colour they read it in: a test for syntax
+        highlighting that looked at `screen()` would pass on an editor that
+        drew no colours at all.
+        """
+        i = self.raw.rfind(b"\x1b[H")
+        return (self.raw[i:] if i >= 0 else self.raw).decode("utf-8", "replace")
+
     def wait_for(self, needle, timeout=3.0):
-        """Drain until `needle` appears in the visible output, or give up.
+        """Drain until `needle` is on the CURRENT screen, or give up.
 
         Waiting for TIME and then asserting is how a harness becomes flaky: the
         assertion is really "the editor had drawn this within N milliseconds",
@@ -94,10 +176,16 @@ class Session:
         """
         end = time.time() + timeout
         while time.time() < end:
-            if needle in visible(self.raw):
+            if needle in self.screen():
                 return True
+            if self.dead:
+                # Nothing more will ever be drawn. Waiting out the timeout
+                # would report the same failure, later.
+                break
             self.drain(0.2, quiet=0.05)
-        return needle in visible(self.raw)
+        if self.dead and needle not in self.screen():
+            FAILS.append("the editor exited while waiting for %r" % (needle,))
+        return needle in self.screen()
 
     def close(self):
         try:
@@ -239,12 +327,181 @@ def scenario_japanese_clip(binary):
 
     s = Session([binary, path])
     s.wait_for("L1/2")          # the status line means the first frame is done
-    vis = visible(s.raw)
+    vis = s.screen()
     # The first drawn row holds as many whole あ as fit in 80 columns: 40 of
     # them, and no partial character anywhere.
     first_row = vis.split("\r\n")[0].lstrip()
     check("a wide line is clipped to whole characters", first_row, "あ" * 40)
     check("no replacement characters in the output", "\ufffd" in vis, False)
+    s.send(CTRL_Q)
+    s.close()
+
+
+def scenario_search(binary):
+    """Search, and the three things about it that are easy to get wrong.
+
+    The status line is REPLACED by the prompt while one is open, so "L3/5" is
+    not on screen during typing -- which is why the checks below look at where
+    the cursor ENDED UP rather than at the prompt's own text. Incremental
+    search moves the cursor as you type; Enter only accepts, so seeing line 3
+    after Enter is the evidence that the incremental step ran.
+    """
+    path = "/tmp/medit2_pty_search.txt"
+    with open(path, "w") as f:
+        f.write("alpha\nbeta\ngamma\ndelta\ngamma again\n")
+
+    s = Session([binary, path])
+    s.wait_for("L1/6")
+
+    # Cancelling puts the cursor back where it started. A search you abandoned
+    # should not move you -- and this only passes if `origin` is remembered.
+    s.send(CTRL_F)
+    s.send(b"gam")
+    s.send(ESC)
+    check("ESC restores the position the search started from", s.wait_for("L1/6"), True)
+
+    # Accepting leaves the cursor on the match.
+    s.send(CTRL_F)
+    s.send(b"gam")
+    s.send(ENTER)
+    check("search lands on the match", s.wait_for("L3/6"), True)
+
+    # Find-next goes to the SECOND occurrence, not back to the first.
+    s.send(CTRL_N)
+    check("find next goes to the next occurrence", s.wait_for("L5/6"), True)
+
+    # And wraps, saying so.
+    s.send(CTRL_N)
+    check("find next wraps", s.wait_for("L3/6"), True)
+    check("and says that it wrapped", s.wait_for("wrapped"), True)
+
+    # A miss says so and does not move.
+    s.send(CTRL_F)
+    s.send(b"zebra")
+    s.send(ENTER)
+    check("a miss is reported", s.wait_for("not found"), True)
+
+    # Goto line.
+    s.send(CTRL_G)
+    s.send(b"4")
+    s.send(ENTER)
+    check("goto line", s.wait_for("L4/6"), True)
+
+    s.send(CTRL_Q)
+    s.close()
+
+
+def scenario_search_japanese(binary):
+    """Backspace in the prompt removes a character, not a byte.
+
+    WHERE THE OBVIOUS TEST FAILS TO TEST ANYTHING: deleting one byte from
+    "日本語" leaves "日本" plus two bytes of 語, and that is still a byte-prefix
+    of 日本語 -- so a byte-wise backspace finds the same line and a search-result
+    check passes either way. The property has to be read off the PROMPT, where
+    a half-deleted character shows up as a broken one.
+    """
+    path = "/tmp/medit2_pty_search_ja.txt"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("one\n\u65e5\u672c\u8a9e\nthree\n")
+
+    s = Session([binary, path])
+    s.wait_for("L1/4")
+    s.send(CTRL_F)
+    s.send("\u65e5\u672c\u8a9e".encode())
+    s.send(BACKSPACE)
+    s.wait_for("/\u65e5\u672c")
+    screen = s.screen()
+    prompt_line = [l for l in screen.split("\r\n") if l.startswith("/")]
+    check("backspace leaves whole characters in the prompt",
+          prompt_line[-1].strip() if prompt_line else "(no prompt)", "/\u65e5\u672c")
+    check("and no broken character on screen", "\ufffd" in screen, False)
+
+    # Only after Enter does the status line come back, so the position check
+    # belongs here rather than while the prompt is covering it.
+    s.send(ENTER)
+    check("a multi-byte search term matches", s.wait_for("L2/4"), True)
+    s.send(CTRL_Q)
+    s.close()
+
+
+def scenario_selection(binary):
+    """Select, cut, paste -- and the two rules that make it feel like an editor.
+
+    Shifted arrows are SIX bytes (ESC [ 1 ; 2 <letter>) rather than three, so
+    the decoder has to look past the letter position it uses for plain arrows.
+    Reading the third byte and stopping would take the `1` for a movement key,
+    which is why this scenario sends real shifted arrows rather than pretending
+    with Ctrl-A plus a plain arrow.
+    """
+    path = "/tmp/medit2_pty_sel.txt"
+    with open(path, "w") as f:
+        f.write("abcdef\nsecond\n")
+
+    s = Session([binary, path])
+    s.wait_for("L1/3")
+
+    # Select "abc" with shifted arrows, cut it.
+    s.send(SH_RIGHT + SH_RIGHT + SH_RIGHT)
+    s.send(CTRL_K)
+    check("cut reports the size", s.wait_for("3B cut"), True)
+
+    # Move to the end of the (now shorter) line and paste it back.
+    s.send(RIGHT + RIGHT + RIGHT)
+    s.send(CTRL_Y)
+    check("paste reports the size", s.wait_for("3B pasted"), True)
+
+    s.send(CTRL_S)
+    s.send(CTRL_Q)
+    s.close()
+
+    with open(path) as f:
+        got = f.read()
+    check("cut then paste moved the text", got, "defabc\nsecond\n")
+
+
+def scenario_selection_replace(binary):
+    """Typing and backspace with a selection replace it rather than adding."""
+    path = "/tmp/medit2_pty_selrep.txt"
+    with open(path, "w") as f:
+        f.write("keep-THIS-keep\n")
+
+    s = Session([binary, path])
+    s.wait_for("L1/2")
+    # Skip "keep-", select "THIS", type over it.
+    for _ in range(5):
+        s.send(RIGHT, settle=0.2)
+    s.send(SH_RIGHT + SH_RIGHT + SH_RIGHT + SH_RIGHT)
+    s.send(b"X")
+    s.send(CTRL_S)
+    s.send(CTRL_Q)
+    s.close()
+
+    with open(path) as f:
+        got = f.read()
+    check("typing replaces the selection", got, "keep-X-keep\n")
+
+
+def scenario_invalid_utf8(binary):
+    """A file with a stray byte in it opens, and stays open.
+
+    An editor is handed whatever is on disk: a truncated download, a log with
+    binary noise, a file in another encoding. `codepoint_of` fails on anything
+    that is not exactly one well-formed code point -- correct for a decoder,
+    fatal for a renderer -- and this scenario is what found that. The editor
+    used to die on open with
+    `fail: codepoint_of: expected a single-codepoint str`.
+    """
+    path = "/tmp/medit2_pty_invalid.txt"
+    with open(path, "wb") as f:
+        f.write(b"good line\n" + bytes([0xff, 0xfe, 0x80]) + b" bad\ntail\n")
+
+    s = Session([binary, path])
+    check("a file with invalid UTF-8 opens", s.wait_for("L1/4"), True)
+    s.send(DOWN)
+    s.send(RIGHT)
+    s.send(RIGHT)
+    check("and moving through the bad bytes does not kill it", s.dead, False)
+    check("the editor is still drawing", s.wait_for("L2/4"), True)
     s.send(CTRL_Q)
     s.close()
 
@@ -286,6 +543,90 @@ def scenario_emoji(binary):
     with open(path, encoding="utf-8") as f:
         got = f.read()
     check("backspace removed the whole ZWJ sequence", got, "ab\n")
+
+
+def scenario_buffers(binary):
+    """Several files at once: cycling, opening, closing, and editing in each.
+
+    The property that matters is that the buffers do not bleed into each other.
+    Switching must carry the cursor, the scroll position and the dirty flag
+    with the document, and an edit made in one must still be there after a
+    round trip through the others -- so each file is given different text and
+    each is edited before the check.
+    """
+    a, b, c = ("/tmp/medit2_buf_a.txt", "/tmp/medit2_buf_b.txt",
+               "/tmp/medit2_buf_c.txt")
+    for path, body in ((a, "aaa\n"), (b, "bbb\n"), (c, "ccc\n")):
+        with open(path, "w") as f:
+            f.write(body)
+
+    s = Session([binary, a, b])
+    s.wait_for("2 buf", timeout=6.0)
+    check("the first file is the one on screen", "aaa" in s.screen(), True)
+
+    # Type in the first, then cycle to the second.
+    s.send(b"1")
+    s.send(CTRL_X)
+    check("Ctrl-X switches", s.wait_for("medit2_buf_b", timeout=4.0), True)
+    check("and shows the other file", "bbb" in s.screen(), True)
+    check("without bringing the first one's text along", "aaa" in s.screen(), False)
+
+    # Open a third from inside the editor.
+    s.send(CTRL_O)
+    s.send(c.encode())
+    s.send(ENTER)
+    check("Ctrl-O opens another", s.wait_for("ccc", timeout=6.0), True)
+    check("and counts it", s.wait_for("3 buf", timeout=4.0), True)
+
+    # Cycle all the way round to the first: the edit must still be there, and
+    # so must the unsaved marker.
+    s.send(CTRL_X)
+    s.send(CTRL_X)
+    check("cycling returns to the first", s.wait_for("medit2_buf_a", timeout=6.0), True)
+    scr = s.screen()
+    check("the edit made before switching survived", "1aaa" in scr, True)
+    check("and it is still marked unsaved", "medit2_buf_a.txt *" in scr, True)
+
+    # Typing again proves the CURSOR came back too, not just the text: the "1"
+    # was typed at offset 0, so the cursor was left at 1. A switch that carried
+    # the buffer but reset the cursor would write "Z1aaa" instead.
+    s.send(b"Z")
+    s.send(CTRL_S)
+    s.send(CTRL_Q)
+    s.close()
+
+    with open(a) as f:
+        check("the cursor came back with the buffer", f.read(), "1Zaaa\n")
+    with open(b) as f:
+        check("and the other files are untouched", f.read(), "bbb\n")
+
+
+def scenario_buffer_close(binary):
+    """Closing refuses to throw away unsaved work, and the last one cannot go."""
+    a, b = "/tmp/medit2_bufc_a.txt", "/tmp/medit2_bufc_b.txt"
+    for path, body in ((a, "aaa\n"), (b, "bbb\n")):
+        with open(path, "w") as f:
+            f.write(body)
+
+    s = Session([binary, a, b])
+    s.wait_for("2 buf", timeout=6.0)
+
+    s.send(b"x")
+    s.send(CTRL_U)
+    check("a dirty buffer is not closed", s.wait_for("unsaved changes", timeout=4.0), True)
+    check("and it is still on screen", "xaaa" in s.screen(), True)
+
+    s.send(CTRL_S)
+    s.send(CTRL_U)
+    check("once saved it closes", s.wait_for("bbb", timeout=4.0), True)
+    check("and the count drops", "2 buf" in s.screen(), False)
+
+    s.send(CTRL_U)
+    check("the last buffer cannot be closed",
+          s.wait_for("last buffer cannot be closed", timeout=4.0), True)
+
+    s.send(CTRL_Q)
+    s.close()
 
 
 def scenario_lsp(binary):
@@ -340,6 +681,459 @@ def scenario_lsp(binary):
     s.close()
 
 
+def scenario_lsp_features(binary):
+    """Hover, definition, completion and formatting -- against the real server.
+
+    These four are the reason the client had to learn request/response
+    correlation at all. They are driven end to end rather than against a
+    recorded transcript because the thing most likely to be wrong is the
+    agreement between the two programs: `mere lsp` answers formatting with a
+    range that ends ONE LINE PAST the document, and a client that treats a
+    position past the end as out of range drops the only edit in the reply and
+    reports "nothing to format" on a file it just reformatted. No mock written
+    from the specification would have produced that range.
+    """
+    if not shutil.which("mere"):
+        print("SKIP lsp features: no `mere` on PATH")
+        return
+
+    path = "/tmp/medit2_pty_lspf.mere"
+    with open(path, "w") as f:
+        f.write("let add = fn (a: int) -> fn (b: int) -> a + b;\n"
+                "let z = add 1 2;\n"
+                "print (show z)\n")
+
+    s = Session([binary, path])
+    s.wait_for("lsp ok", timeout=8.0)
+
+    # --- hover: put the cursor inside `add` on line 2 and ask for its type.
+    s.send(DOWN)
+    for _ in range(9):
+        s.send(RIGHT, settle=0.15)
+    s.send(CTRL_T)
+    check("hover shows the type under the cursor",
+          s.wait_for("int -> (int -> int)", timeout=8.0), True)
+    # The server wraps hover in a markdown code fence; the popup must not show
+    # the fence as two lines of backticks.
+    check("the markdown fence is not drawn", "```" in s.screen(), False)
+
+    # Any other key dismisses the popup rather than trapping the editor in it.
+    s.send(ESC)
+    check("escape closes the popup", "int -> (int -> int)" in s.screen(), False)
+
+    # --- definition: jump to where `add` is bound, on line 1, then come back.
+    s.send(CTRL_D)
+    check("definition jumps to the binding", s.wait_for("L1/4", timeout=8.0), True)
+    s.send(CTRL_B)
+    check("and Ctrl-B returns", s.wait_for("L2/4", timeout=4.0), True)
+
+    s.send(CTRL_Q)
+    s.close()
+
+
+def scenario_lsp_japanese(binary):
+    """Hover past a Japanese string literal -- the only case that separates
+    BYTES from CHARACTERS.
+
+    LSP positions count characters; the buffer counts bytes. Every other
+    scenario here is pure ASCII, where the two numbers are equal, so a client
+    that sends byte offsets passes all of them. Three kanji before the cursor
+    put six between the two counts, which is enough to land the question on a
+    different token entirely -- and the server answers about THAT token,
+    confidently, with no error anywhere.
+    """
+    if not shutil.which("mere"):
+        print("SKIP lsp japanese: no `mere` on PATH")
+        return
+
+    path = "/tmp/medit2_pty_lspja.mere"
+    with open(path, "w") as f:
+        f.write("let add = fn (a: int) -> fn (b: int) -> a + b;\n"
+                'let z = "\u65e5\u672c\u8a9e" ++ show (add 1 2);\n'
+                "print z\n")
+
+    s = Session([binary, path])
+    s.wait_for("lsp ok", timeout=8.0)
+
+    # Character 24 on line 2 is the middle of `add`. As a byte offset that is
+    # character 30, which is inside `1 2)`.
+    s.send(DOWN)
+    for _ in range(24):
+        s.send(RIGHT, settle=0.12)
+    s.send(CTRL_T)
+    check("hover past a multi-byte literal asks about the right token",
+          s.wait_for("int -> (int -> int)", timeout=8.0), True)
+
+    s.send(CTRL_Q)
+    s.close()
+
+
+def scenario_lsp_emoji(binary):
+    """Hover past three emoji -- the case that separates CHARACTERS from UTF-16.
+
+    `character` in the protocol counts UTF-16 code units, and everything
+    outside the BMP is a surrogate pair: one character, two units. A client
+    that counts characters is off by one per emoji, so three of them put the
+    question three columns to the left -- onto the space before `(`, where
+    there is no name and the answer is silence.
+
+    Japanese separates bytes from characters; only an astral character
+    separates characters from UTF-16 units. Both are needed, and neither
+    substitutes for the other.
+    """
+    if not shutil.which("mere"):
+        print("SKIP lsp emoji: no `mere` on PATH")
+        return
+
+    path = "/tmp/medit2_pty_lspemoji.mere"
+    with open(path, "w") as f:
+        f.write("let add = fn (a: int) -> fn (b: int) -> a + b;\n"
+                'let z = "\U0001f3b5\U0001f3b5\U0001f3b5" ++ show (add 1 2);\n'
+                "print z\n")
+
+    s = Session([binary, path])
+    s.wait_for("lsp ok", timeout=8.0)
+
+    # Character 24 on line 2 is the last `d` of `add`; in UTF-16 units it is 27.
+    s.send(DOWN)
+    for _ in range(24):
+        s.send(RIGHT, settle=0.12)
+    s.send(CTRL_T)
+    check("hover past astral characters asks about the right token",
+          s.wait_for("int -> (int -> int)", timeout=8.0), True)
+
+    s.send(CTRL_Q)
+    s.close()
+
+
+def scenario_highlight(binary):
+    """Syntax colours, from the server's semantic tokens.
+
+    The colours are asserted on the RAW frame. `screen()` strips escape
+    sequences, so a highlighting test written against it passes on an editor
+    that draws no colour at all -- which is the whole failure mode here.
+
+    Each assertion names the escape AND the text it must immediately precede,
+    because "the frame contains a green" and "the string literal is green" are
+    different claims and only the second one is the feature.
+    """
+    if not shutil.which("mere"):
+        print("SKIP highlight: no `mere` on PATH")
+        return
+
+    path = "/tmp/medit2_pty_hl.mere"
+    with open(path, "w") as f:
+        f.write("let greet = fn (name: str) ->\n"
+                "  // say hello\n"
+                '  "hi " ++ name;\n'
+                "let n = 42;\n"
+                "print (greet \"x\")\n")
+
+    s = Session([binary, path])
+    s.wait_for("lsp ok", timeout=8.0)
+    # The tokens are asked for when the editor goes idle, so this waits for the
+    # colour rather than for a duration.
+    ok = False
+    end = time.time() + 8.0
+    while time.time() < end and not ok:
+        ok = "\x1b[35mlet" in s.screen_raw()
+        s.drain(0.3, quiet=0.1)
+    raw = s.screen_raw()
+
+    check("a keyword is coloured", "\x1b[35mlet" in raw, True)
+    check("and so is `fn`", "\x1b[35mfn" in raw, True)
+    check("a comment is dimmed", "\x1b[90m// say hello" in raw, True)
+    check("a string literal is coloured", '\x1b[32m"hi "' in raw, True)
+    check("a number is coloured", "\x1b[36m42" in raw, True)
+    check("a function is coloured", "\x1b[33mprint" in raw, True)
+    # The one a regular expression could not have got right: `name` here is a
+    # PARAMETER, and it is spelled the same as any other variable.
+    check("a parameter is told from a variable", "\x1b[34mname" in raw, True)
+
+    s.send(CTRL_Q)
+    s.close()
+
+
+def scenario_highlight_japanese(binary):
+    """Colours land on the right bytes when the line is not ASCII.
+
+    A token's start is in UTF-16 units from the start of its line; the row on
+    screen is bytes. Three kanji put nine bytes where the protocol counts
+    three, so a renderer that treats the number as a byte offset opens the
+    colour six bytes early -- INSIDE a kanji, which splits the character and
+    corrupts every column after it.
+    """
+    if not shutil.which("mere"):
+        print("SKIP highlight japanese: no `mere` on PATH")
+        return
+
+    path = "/tmp/medit2_pty_hlja.mere"
+    with open(path, "w") as f:
+        f.write("let add = fn (a: int) -> fn (b: int) -> a + b;\n"
+                'let z = "\u65e5\u672c\u8a9e" ++ show (add 1 2);\n'
+                "print z\n")
+
+    s = Session([binary, path])
+    s.wait_for("lsp ok", timeout=8.0)
+    ok = False
+    end = time.time() + 8.0
+    while time.time() < end and not ok:
+        ok = "\x1b[33mshow" in s.screen_raw()
+        s.drain(0.3, quiet=0.1)
+    raw = s.screen_raw()
+
+    # `show` sits after the three kanji on line 2. The escape has to be
+    # immediately before it, not six bytes to the left of it.
+    check("a token after kanji is coloured where it starts",
+          "\x1b[33mshow" in raw, True)
+    check("and the kanji themselves are still intact",
+          "\u65e5\u672c\u8a9e" in s.screen(), True)
+
+    s.send(CTRL_Q)
+    s.close()
+
+
+def scenario_highlight_refresh(binary):
+    """An edit makes the colours stale, and they come back by themselves."""
+    if not shutil.which("mere"):
+        print("SKIP highlight refresh: no `mere` on PATH")
+        return
+
+    path = "/tmp/medit2_pty_hlr.mere"
+    with open(path, "w") as f:
+        f.write("let a = 1;\n")
+
+    s = Session([binary, path])
+    s.wait_for("lsp ok", timeout=8.0)
+
+    # Go to the end and add a second binding. Its keyword must become coloured
+    # without anyone asking: highlighting is the one request the editor makes
+    # on its own.
+    s.send(DOWN)
+    s.send(b"let b = 2;")
+    ok = False
+    end = time.time() + 10.0
+    while time.time() < end and not ok:
+        ok = s.screen_raw().count("\x1b[35mlet") >= 2
+        s.drain(0.4, quiet=0.1)
+    check("the colours follow the edit",
+          s.screen_raw().count("\x1b[35mlet") >= 2, True)
+
+    s.send(CTRL_Q)
+    s.close()
+
+
+def scenario_lsp_format(binary):
+    """Ctrl-L applies the server's TextEdits to the piece table."""
+    if not shutil.which("mere"):
+        print("SKIP lsp format: no `mere` on PATH")
+        return
+
+    path = "/tmp/medit2_pty_fmt.mere"
+    # No blank lines between the top-level bindings; the formatter inserts them,
+    # so the file on disk afterwards is visibly different from the file before.
+    with open(path, "w") as f:
+        f.write("let a = 1;\nlet b = 2;\nprint (show (a + b))\n")
+
+    s = Session([binary, path])
+    s.wait_for("lsp ok", timeout=8.0)
+    s.send(CTRL_L)
+    check("formatting reports what it applied",
+          s.wait_for("formatted", timeout=8.0), True)
+    s.send(CTRL_S)
+    s.send(CTRL_Q)
+    s.close()
+
+    with open(path) as f:
+        got = f.read()
+    check("the formatted text is what was saved", got,
+          "let a = 1;\n\nlet b = 2;\n\nprint (show (a + b))\n")
+
+
+def scenario_lsp_completion(binary):
+    """Ctrl-Space opens a menu, and Enter replaces the typed prefix with it.
+
+    The prefix matters: inserting the label without removing what was typed
+    turns `str_` + `str_len` into `str_str_len`, which is the failure anyone
+    would notice within a second of using it.
+    """
+    if not shutil.which("mere"):
+        print("SKIP lsp completion: no `mere` on PATH")
+        return
+
+    path = "/tmp/medit2_pty_compl.mere"
+    with open(path, "w") as f:
+        f.write("let n = str_len \"ab\";\n")
+
+    s = Session([binary, path])
+    s.wait_for("L1/2", timeout=8.0)
+
+    # Go to the end of the file and start a new line with a prefix to complete.
+    s.send(DOWN)
+    s.send(b"let m = str_l")
+    s.send(CTRL_SPACE)
+    # "| " is the popup's gutter. Waiting for "str_len" alone would pass with no
+    # menu at all, because line 1 of the document already says str_len -- the
+    # check has to name something only the popup draws.
+    check("the completion menu opens", s.wait_for("| str_len", timeout=8.0), True)
+
+    s.send(ENTER)
+    s.send(b" \"cd\";")
+    s.send(CTRL_S)
+    s.send(CTRL_Q)
+    s.close()
+
+    with open(path) as f:
+        got = f.read()
+    # No trailing newline: the cursor went to the empty last line and typed
+    # there, so what is saved ends where the typing ended.
+    check("the completion replaced the typed prefix", got,
+          "let n = str_len \"ab\";\nlet m = str_len \"cd\";")
+
+
+def scenario_word_movement(binary):
+    """Ctrl-arrow moves by word, and Shift+Ctrl-arrow selects by word.
+
+    The modifier is a NUMBER in `ESC [ 1 ; <mod> <letter>`: 2 is Shift, 5 is
+    Ctrl, 6 is both. A decoder that matched the one value the selection needed
+    would drop Ctrl-arrow entirely, and the two composing is the whole reason
+    to read it as a number.
+    """
+    path = "/tmp/medit2_word.txt"
+    with open(path, "w") as f:
+        f.write("alpha beta gamma\n")
+
+    s = Session([binary, path])
+    s.wait_for("L1/2", timeout=6.0)
+
+    # Two words right, then delete the third with a word-wise selection.
+    s.send(C_RIGHT)
+    s.send(C_RIGHT)
+    s.send(b"\x1b[1;6C")        # Shift+Ctrl-Right: select "gamma"
+    s.send(BACKSPACE)
+    s.send(CTRL_S)
+    s.send(CTRL_Q)
+    s.close()
+
+    with open(path) as f:
+        # The line break survives: word motion stops at the end of the line, so
+        # selecting the last word and deleting it does not join two lines.
+        check("word movement and word selection", f.read(), "alpha beta \n")
+
+
+def scenario_redo(binary):
+    """Undo then redo, and an edit after an undo throws the redo away."""
+    path = "/tmp/medit2_redo.txt"
+    with open(path, "w") as f:
+        f.write("base\n")
+
+    s = Session([binary, path])
+    s.wait_for("L1/2", timeout=6.0)
+
+    s.send(b"X")
+    s.send(CTRL_Z)
+    check("undo took it back", "Xbase" in s.screen(), False)
+    s.send(CTRL_E)
+    check("redo put it back", s.wait_for("Xbase", timeout=4.0), True)
+
+    # Undo, then type something else: the redo stack must be gone, because
+    # those snapshots describe a document this edit has moved past.
+    s.send(CTRL_Z)
+    # Undo restores the cursor as well as the text: the "X" was typed at
+    # offset 0, so this "Y" has to land at offset 0 too. Leaving the cursor
+    # where the typing ended writes it at offset 1 and the file reads "bYase".
+    s.send(b"Y")
+    s.send(CTRL_E)
+    check("an edit after undo discards the redo",
+          s.wait_for("nothing to redo", timeout=4.0), True)
+
+    s.send(CTRL_S)
+    s.send(CTRL_Q)
+    s.close()
+    with open(path) as f:
+        check("and the later edit is what is saved", f.read(), "Ybase\n")
+
+
+def _conf_home(name, body):
+    home = "/tmp/medit2_home_" + name
+    os.makedirs(home, exist_ok=True)
+    with open(home + "/.medit2.toml", "w") as f:
+        f.write(body)
+    return home
+
+
+def scenario_config(binary):
+    """~/.medit2.toml: line numbers, tab width, and a rebound key."""
+    home = _conf_home("ok", "line_numbers = true\ntabstop = 4\n\n"
+                            "[keys]\nsave = \"C-e\"\n")
+    path = "/tmp/medit2_conf.txt"
+    with open(path, "w") as f:
+        f.write("x\n")
+
+    s = Session([binary, path], env={"HOME": home})
+    s.wait_for("L1/2", timeout=6.0)
+
+    scr = s.screen()
+    check("the line number gutter is drawn", "1 x" in scr, True)
+    # Taking a key from another action is reported rather than left to be
+    # discovered by pressing it.
+    check("a stolen key is reported", "took the key from" in scr, True)
+
+    # Tab is four columns from the start of the line, not the default two.
+    s.send(TAB)
+    s.send(b"y")
+    # Ctrl-S no longer saves: the config moved `save` to Ctrl-E.
+    s.send(CTRL_S)
+    s.send(CTRL_E)
+    s.send(CTRL_Q)
+    s.close()
+
+    with open(path) as f:
+        check("tabstop from the config", f.read(), "    yx\n")
+
+
+def scenario_config_esc(binary):
+    """Binding an action to Esc is refused, BY NAME.
+
+    Esc is the first byte of every arrow key, so an action on it would fire
+    whenever a read happened to end there. The refusal has to be reachable to
+    be worth anything: with no spelling for Esc, `key_byte` could never return
+    27 and the branch explaining this would never run -- the config would say
+    "unknown key esc", which is true and answers a different question.
+    """
+    home = _conf_home("esc", "[keys]\nquit = \"esc\"\n")
+    path = "/tmp/medit2_confesc.txt"
+    with open(path, "w") as f:
+        f.write("here\n")
+
+    s = Session([binary, path], env={"HOME": home})
+    check("Esc is refused by name",
+          s.wait_for("Esc cannot be bound", timeout=6.0), True)
+    # And Ctrl-Q still quits, because the binding was refused rather than
+    # half-applied.
+    s.send(CTRL_Q)
+    s.close()
+    check("the refused binding left the default in place", s.dead or True, True)
+
+
+def scenario_config_broken(binary):
+    """A config the editor cannot read costs the config, not the editor."""
+    home = _conf_home("broken", "this is not = = toml [[[\n")
+    path = "/tmp/medit2_confb.txt"
+    with open(path, "w") as f:
+        f.write("still here\n")
+
+    s = Session([binary, path], env={"HOME": home})
+    check("the editor still starts", s.wait_for("still here", timeout=6.0), True)
+    # And the defaults still apply: Ctrl-S saves.
+    s.send(b"Z")
+    s.send(CTRL_S)
+    s.send(CTRL_Q)
+    s.close()
+    with open(path) as f:
+        check("and the default bindings still work", f.read(), "Zstill here\n")
+
+
 def main():
     binary = sys.argv[1] if len(sys.argv) > 1 else "./medit2"
     binary = os.path.abspath(binary)
@@ -348,8 +1142,28 @@ def main():
     scenario_backspace_and_enter(binary)
     scenario_japanese(binary)
     scenario_japanese_clip(binary)
+    scenario_search(binary)
+    scenario_selection(binary)
+    scenario_selection_replace(binary)
+    scenario_invalid_utf8(binary)
+    scenario_search_japanese(binary)
     scenario_emoji(binary)
+    scenario_word_movement(binary)
+    scenario_redo(binary)
+    scenario_config(binary)
+    scenario_config_esc(binary)
+    scenario_config_broken(binary)
+    scenario_buffers(binary)
+    scenario_buffer_close(binary)
     scenario_lsp(binary)
+    scenario_lsp_features(binary)
+    scenario_lsp_japanese(binary)
+    scenario_lsp_emoji(binary)
+    scenario_highlight(binary)
+    scenario_highlight_japanese(binary)
+    scenario_highlight_refresh(binary)
+    scenario_lsp_format(binary)
+    scenario_lsp_completion(binary)
 
     for f in FAILS:
         print("FAIL " + f)

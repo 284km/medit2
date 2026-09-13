@@ -1,0 +1,118 @@
+// test/search_test.mere — literal search, including the cases a naive
+// implementation gets wrong.
+//
+// Run: mere test/search_test.mere
+//      mere -c test/search_test.mere > t.c && clang -O2 t.c -o t && ./t
+//
+// The interesting cases are not "does it find a word in a sentence". They are:
+//
+//   - a match that STRADDLES a window boundary, which the overlap exists for
+//   - a needle LONGER than a window
+//   - searching backward, where `str_index_of` finds the first occurrence and
+//     the answer is the last one
+//   - wrapping, and saying that it wrapped
+//
+// The straddle case is built with a real window size rather than a shrunken
+// one: a test that redefines the page to 8 bytes is testing a different
+// program from the one that ships.
+
+import "../src/buffer.mere";
+import "../src/search.mere";
+
+let fails = vec_new ();
+
+let check = fn (name: str) -> fn (got: int) -> fn (want: int) ->
+  if got == want then ()
+  else vec_push fails (name ++ ": got " ++ show got ++ " want " ++ show want);
+
+let check_b = fn (name: str) -> fn (got: bool) -> fn (want: bool) ->
+  if got == want then ()
+  else vec_push fails (name ++ ": got " ++ (if got then "true" else "false"));
+
+// --- small, in memory ------------------------------------------------------
+let s = "the quick brown fox jumps over the lazy dog";
+let b = Buffer.of_str s;
+let n = str_len s;
+
+let _ = check "forward finds the first" (Search.forward b n 0 "the") 0;
+let _ = check "forward from past it finds the second" (Search.forward b n 1 "the") 31;
+let _ = check "forward misses what is not there" (Search.forward b n 0 "zebra") (0 - 1);
+let _ = check "forward at the very end" (Search.forward b n 0 "dog") 40;
+let _ = check "empty needle is not a match" (Search.forward b n 0 "") (0 - 1);
+let _ = check "needle longer than the text" (Search.forward b n 0 (s ++ "x")) (0 - 1);
+
+// Backward has to return the LAST match before the point, not the first.
+let _ = check "backward finds the last before" (Search.backward b n n "the") 31;
+let _ = check "backward before the second finds the first" (Search.backward b n 31 "the") 0;
+let _ = check "backward from 0 finds nothing" (Search.backward b n 0 "the") (0 - 1);
+let _ = check "backward misses what is not there" (Search.backward b n n "zebra") (0 - 1);
+
+// A match ENDING exactly at the search point still starts before it.
+let _ = check "backward includes a match ending at the point" (Search.backward b n 3 "the") 0;
+
+// --- wrapping --------------------------------------------------------------
+let w1 = Search.find_next b n 35 "the" in
+let _ = check "find_next wraps to the start" (fst w1) 0;
+let _ = check_b "find_next says it wrapped" (snd w1) true;
+
+let w2 = Search.find_next b n 0 "the" in
+let _ = check "find_next does not wrap when it need not" (fst w2) 0;
+let _ = check_b "find_next says it did not wrap" (snd w2) false;
+
+let w3 = Search.find_prev b n 1 "the" in
+let _ = check "find_prev wraps to the end" (fst w3) 31;
+let _ = check_b "find_prev says it wrapped" (snd w3) true;
+
+// --- a window boundary, at the real window size ----------------------------
+// The needle is placed so that it straddles the 256 KiB boundary: half of it
+// is in the first window and half in the second. Without the overlap this is
+// exactly the case that comes back -1.
+let page = Search.page;
+let needle = "STRADDLE";
+let nlen = str_len needle;
+let half = nlen / 2;
+
+let path = "/tmp/medit2_search_boundary.bin";
+let rec fill = fn (buf: StrBuf[R]) -> fn (i: int) -> fn (upto: int) ->
+  if i >= upto then () else let _ = strbuf_push buf "x" in fill buf (i + 1) upto;
+let _ =
+  let sb = strbuf_new () in
+  let _ = fill sb 0 (page - half) in
+  let _ = strbuf_push sb needle in
+  let _ = fill sb 0 (page - half) in
+  write_file path (strbuf_to_str sb);
+
+let bsz = file_size path;
+let bf = file_openrw path;
+let bb = Buffer.of_origin (Disk ((bf, bsz)));
+
+let _ = check "a match straddling the window boundary is found"
+          (Search.forward bb bsz 0 needle) (page - half);
+let _ = check "and backward finds the same one"
+          (Search.backward bb bsz bsz needle) (page - half);
+// Starting inside the straddle must not find it again.
+let _ = check "forward past the straddle finds nothing"
+          (Search.forward bb bsz (page - half + 1) needle) (0 - 1);
+let _ = file_close bf;
+
+// --- a needle longer than a window -----------------------------------------
+// The window grows to fit rather than the search failing quietly.
+let longpath = "/tmp/medit2_search_long.bin";
+let longneedle =
+  let sb = strbuf_new () in
+  let _ = fill sb 0 (page + 100) in
+  strbuf_to_str sb;
+let _ = write_file longpath ("head" ++ longneedle ++ "tail");
+let lsz = file_size longpath;
+let lf = file_openrw longpath;
+let lb = Buffer.of_origin (Disk ((lf, lsz)));
+let _ = check "a needle longer than one window is found"
+          (Search.forward lb lsz 0 longneedle) 4;
+let _ = file_close lf;
+
+// --- report ----------------------------------------------------------------
+let nf = vec_len fails;
+let rec report = fn (i: int) ->
+  if i >= nf then () else let _ = print ("FAIL " ++ vec_get fails i) in report (i + 1);
+let _ = report 0;
+print (if nf == 0 then "search: all ok" else "search: " ++ show nf ++ " FAILED")

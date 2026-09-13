@@ -27,15 +27,31 @@ type origin = Mem of str | Disk of (File * int);
 // and split far more often than it is read.
 type piece = { from_add: bool, off: int, len: int };
 
-// The undo stack: (pieces, add) before each edit. `add` is restored too, so
-// undoing an insert leaves no piece pointing at the typed text.
-type hist = Empty | Snap of (piece list * str * hist);
+// The undo stack: (pieces, add) before each edit, plus a MARK the caller may
+// write on it. `add` is restored too, so undoing an insert leaves no piece
+// pointing at the typed text.
+//
+// The mark is an opaque integer this file never interprets. The editor puts
+// the cursor position in it, because undo that restores the text and leaves
+// the cursor where the typing ended puts your next keystroke in the wrong
+// place -- type `X` at the start of `base`, undo, and the next character lands
+// at offset 1. It lives here rather than in a parallel stack in the editor
+// because a parallel stack has to be pushed and popped in exactly the same
+// places as this one, and the first edit that forgets desynchronises them
+// silently.
+type hist = Empty | Snap of (piece list * str * int * hist);
 
 type buf = {
   pieces: piece list,   // document order
   add: str,             // append-only; pieces point into it
   origin: origin,
   hist: hist,
+  // What undo took away, so redo can put it back. A SEPARATE stack rather than
+  // a cursor into `hist`, because an edit made after an undo has to discard
+  // it: redoing onto a document that has moved on would splice in pieces that
+  // point at text the later edit already invalidated. Every edit clears it,
+  // which is what every editor does and the only safe rule here.
+  redo: hist,
 };
 
 module Buffer {
@@ -64,7 +80,8 @@ module Buffer {
     let n = origin_len o in
     let whole = if n <= 0 then Nil
                 else Cons ((piece { from_add = false, off = 0, len = n } : piece), Nil) in
-    (buf { pieces = whole, add = "", origin = o, hist = Empty } : buf);
+    (buf { pieces = whole, add = "", origin = o, hist = Empty,
+           redo = Empty } : buf);
 
   let of_str = fn (s: str) -> of_origin (Mem s);
 
@@ -172,9 +189,11 @@ module Buffer {
       let before = fst parts in
       let after = snd parts in
       let p = (piece { from_add = true, off = str_len b.add, len = str_len s } : piece) in
+      // An edit after an undo discards the redo stack: those snapshots
+      // describe a document this edit has already moved past.
       ({ b | pieces = _rebuild before (_cons_fused p after),
              add = b.add ++ s,
-             hist = Snap ((b.pieces, b.add, b.hist)) } : buf);
+             hist = Snap ((b.pieces, b.add, 0 - 1, b.hist)), redo = Empty } : buf);
 
   // Drop `count` bytes off the front of a piece list.
   let rec _drop = fn (ps: piece list) -> fn (count: int) ->
@@ -198,16 +217,52 @@ module Buffer {
         let before = fst parts in
         let after = _drop (snd parts) count in
         ({ b | pieces = _rebuild before after,
-               hist = Snap ((b.pieces, b.add, b.hist)) } : buf);
+               hist = Snap ((b.pieces, b.add, 0 - 1, b.hist)), redo = Empty } : buf);
 
   // Undo is one cons off the stack.
   let undo = fn (b: buf) ->
     match b.hist with
     | Empty -> b
-    | Snap (ps, ad, rest) -> ({ b | pieces = ps, add = ad, hist = rest } : buf);
+    | Snap (ps, ad, _, rest) ->
+      // The state being left is pushed onto the redo stack, not thrown away.
+      ({ b | pieces = ps, add = ad, hist = rest,
+             redo = Snap ((b.pieces, b.add, 0 - 1, b.redo)) } : buf);
+
+  let redo = fn (b: buf) ->
+    match b.redo with
+    | Empty -> b
+    | Snap (ps, ad, _, rest) ->
+      ({ b | pieces = ps, add = ad, redo = rest,
+             hist = Snap ((b.pieces, b.add, 0 - 1, b.hist)) } : buf);
+
+  // --- the caller's mark on the top of each stack --------------------------
+  // Separate from `insert` and `delete` so their signatures do not change:
+  // between them they have two dozen call sites in the tests, and widening
+  // them to carry a number this file does not use would be churn in every one.
+
+  let mark = fn (b: buf) -> fn (m: int) ->
+    match b.hist with
+    | Empty -> b
+    | Snap (ps, ad, _, rest) -> ({ b | hist = Snap ((ps, ad, m, rest)) } : buf);
+
+  let mark_of = fn (b: buf) ->
+    match b.hist with | Empty -> 0 - 1 | Snap (_, _, m, _) -> m;
+
+  let mark_redo = fn (b: buf) -> fn (m: int) ->
+    match b.redo with
+    | Empty -> b
+    | Snap (ps, ad, _, rest) -> ({ b | redo = Snap ((ps, ad, m, rest)) } : buf);
+
+  let mark_redo_of = fn (b: buf) ->
+    match b.redo with | Empty -> 0 - 1 | Snap (_, _, m, _) -> m;
 
   let can_undo = fn (b: buf) ->
     match b.hist with
     | Empty -> false
-    | Snap (_, _, _) -> true;
+    | Snap (_, _, _, _) -> true;
+
+  let can_redo = fn (b: buf) ->
+    match b.redo with
+    | Empty -> false
+    | Snap (_, _, _, _) -> true;
 }

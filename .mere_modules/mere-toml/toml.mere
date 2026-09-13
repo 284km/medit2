@@ -1,0 +1,197 @@
+// contrib/toml/toml.mere — minimal TOML 1.0 parser
+//
+// Supported subset (minimal from TOML 1.0):
+//   - key/value: `key = value`
+//   - section: `[section]` / `[a.b.c]` (dotted = nested; flattened to a
+//     fully-qualified key)
+//   - values: int / str (basic double-quoted; escapes `\"` `\\` `\n` `\t`)
+//     / bool / array
+//   - comment: `#` to end of line (skipped except inside a string)
+//   - empty lines / leading whitespace are skipped
+//
+// Not supported (future Phase or separate lib):
+//   - datetime (RFC 3339)
+//   - multi-line string (`"""..."""` / `'''...'''`)
+//   - literal string (`'...'`)
+//   - dotted key (`a.b = 1`), inline table (`{ k = v }`), table array (`[[name]]`)
+//   - hex / octal / binary integer, float exponent, underscore separator
+//
+// Usage:
+//   import "contrib/toml/toml.mere";
+//   let doc = Toml.parse_toml "
+//   [server]
+//   host = \"localhost\"
+//   port = 8080
+//   " in
+//   match Toml.get doc "server.host" with
+//   | Toml.TStr s -> print s
+//   | _ -> ();
+//
+// The output is `(str * toml_value) list`, with the key qualified by the
+// section path (e.g. `port` under section `[server]` becomes "server.port").
+
+module Toml {
+
+type toml_value =
+  | TInt  of int
+  | TStr  of str
+  | TBool of bool
+  | TArr  of toml_value list;
+
+// rev (for accumulator-style parsing)
+let rec rev_aux = fn (xs, acc) ->
+  match xs with
+  | [] -> acc
+  | [h, ...t] -> rev_aux t (Cons (h, acc));
+
+let rev = fn xs -> rev_aux xs Nil;
+
+// strip `#` to end of line (but keep `#` inside a basic string)
+let strip_comment = fn (line: str) ->
+  let n = str_len line in
+  let rec scan = fn (i: int) -> fn (in_str: bool) ->
+    if i >= n then n
+    else
+      let c = char_at line i in
+      if in_str then
+        if c == "\"" then scan (i + 1) false
+        else if c == "\\" && i + 1 < n then scan (i + 2) true
+        else scan (i + 1) true
+      else if c == "#" then i
+      else if c == "\"" then scan (i + 1) true
+      else scan (i + 1) false in
+  let end_pos = scan 0 false in
+  str_trim (substring line 0 end_pos);
+
+// decode escapes in a basic string (\" -> ", \\ -> \, \n -> newline, \t -> tab)
+let decode_basic_str = fn (s: str) ->
+  let n = str_len s in
+  let buf = strbuf_new () in
+  let rec loop = fn i ->
+    if i >= n then ()
+    else
+      let c = char_at s i in
+      if c == "\\" && i + 1 < n then
+        let e = char_at s (i + 1) in
+        let _ = if e == "\"" then strbuf_push buf "\""
+                else if e == "\\" then strbuf_push buf "\\"
+                else if e == "n" then strbuf_push buf "\n"
+                else if e == "t" then strbuf_push buf "\t"
+                else
+                  let _ = strbuf_push buf c in
+                  strbuf_push buf e in
+        loop (i + 2)
+      else
+        let _ = strbuf_push buf c in
+        loop (i + 1) in
+  let _ = loop 0 in
+  strbuf_to_str buf;
+
+// Split a string on top-level `,` (simple: `,` inside nested arrays or
+// strings is ignored). Returns the trimmed parts in original order.
+let split_top_comma = fn (s: str) ->
+  let n = str_len s in
+  // accumulator-style: cons at end + reverse at the finish
+  let rec loop = fn (i: int) -> fn (start: int) -> fn (depth: int) ->
+                 fn (in_str: bool) -> fn (acc: str list) ->
+    if i >= n then
+      let last = str_trim (substring s start n) in
+      if str_len last > 0 then Cons (last, acc) else acc
+    else
+      let c = char_at s i in
+      if in_str then
+        if c == "\"" then loop (i + 1) start depth false acc
+        else if c == "\\" && i + 1 < n then loop (i + 2) start depth true acc
+        else loop (i + 1) start depth true acc
+      else if c == "\"" then loop (i + 1) start depth true acc
+      else if c == "[" then loop (i + 1) start (depth + 1) false acc
+      else if c == "]" then loop (i + 1) start (depth - 1) false acc
+      else if c == "," && depth == 0 then
+        let part = str_trim (substring s start i) in
+        let new_acc = if str_len part > 0 then Cons (part, acc) else acc in
+        loop (i + 1) (i + 1) 0 false new_acc
+      else loop (i + 1) start depth in_str acc in
+  rev (loop 0 0 0 false Nil);
+
+// Parse a value: `42` / `true` / `false` / `"str"` / `[1, 2]`
+let rec parse_value = fn (raw: str) ->
+  let s = str_trim raw in
+  let n = str_len s in
+  if n == 0 then fail "empty TOML value"
+  else if s == "true" then TBool true
+  else if s == "false" then TBool false
+  else if char_at s 0 == "\"" then
+    // basic string: find the end quote from the tail. For simplicity we
+    // assume it is completed within one line.
+    if n < 2 || char_at s (n - 1) != "\"" then
+      fail ("unterminated string: " ++ s)
+    else
+      let inner = substring s 1 (n - 1) in
+      TStr (decode_basic_str inner)
+  else if char_at s 0 == "[" then
+    if n < 2 || char_at s (n - 1) != "]" then
+      fail ("array missing closing `]`: " ++ s)
+    else
+      let inner = substring s 1 (n - 1) in
+      let parts = split_top_comma inner in
+      TArr (list_map parts parse_value)
+  else
+    // integer (also handle a leading sign char for negatives)
+    let first = char_at s 0 in
+    let body_ok =
+      if first == "-" || first == "+" then n > 1 && is_digit (char_at s 1)
+      else is_digit first in
+    if body_ok then TInt (int_of_str s)
+    else fail ("unknown TOML value: " ++ s);
+
+// Interpret one line and return an updated (current_section, results).
+//   - section header `[a.b]` -> change current_section to `"a.b"`, results unchanged
+//   - key/value `k = v` -> append `(prefix + k, parsed value)` to results
+//   - blank line / comment-only -> unchanged
+let parse_line = fn (line: str) -> fn (state: (str * (str * toml_value) list)) ->
+  let (current_section, results) = state in
+  let stripped = strip_comment line in
+  let n = str_len stripped in
+  if n == 0 then state
+  else if char_at stripped 0 == "[" then
+    if char_at stripped (n - 1) != "]" then
+      fail ("malformed section header: " ++ line)
+    else
+      let new_section = str_trim (substring stripped 1 (n - 1)) in
+      (new_section, results)
+  else
+    let eq_idx = str_index_of stripped "=" in
+    if eq_idx <= 0 then fail ("malformed line (no `=`): " ++ line)
+    else
+      let key = str_trim (substring stripped 0 eq_idx) in
+      let raw_val = str_trim (substring stripped (eq_idx + 1) n) in
+      let v = parse_value raw_val in
+      let qualified = if str_len current_section > 0
+                      then current_section ++ "." ++ key
+                      else key in
+      (current_section, Cons ((qualified, v), results));
+
+// Main entry: input str -> (str * toml_value) list (preserves source order)
+let parse_toml = fn (input: str) ->
+  let lines = str_split input "\n" in
+  let init = ("", Nil) in
+  let final_state =
+    list_fold lines init (fn state -> fn line -> parse_line line state) in
+  let (_, results) = final_state in
+  rev results;
+
+// key lookup helper (fails if not found)
+let rec get = fn (doc: (str * toml_value) list) -> fn (key: str) ->
+  match doc with
+  | [] -> fail ("TOML key not found: " ++ key)
+  | [(k, v), ...rest] ->
+    if k == key then v
+    else get rest key;
+
+// has key
+let rec has = fn (doc: (str * toml_value) list) -> fn (key: str) ->
+  match doc with
+  | [] -> false
+  | [(k, _), ...rest] -> if k == key then true else has rest key;
+
+};   // end of `module Toml`

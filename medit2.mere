@@ -25,6 +25,8 @@ import "src/lines.mere";
 import "mere-unicode/width.mere";
 import "mere-unicode/grapheme.mere";
 import "src/lsp.mere";
+import "src/search.mere";
+import "mere-toml/toml.mere";
 
 // --- the host -------------------------------------------------------------
 // Implemented in shim/medit2_shim.c. The compiler emits an `extern` prototype
@@ -41,6 +43,10 @@ extern fn term_cols: unit -> int;
 // that are read(2)/write(2) rather than recv/send.
 extern fn io_poll_new: int -> int;
 extern fn io_poll_add: int -> int -> int -> int;
+extern fn io_poll_del: int -> int -> int;
+// For `$HOME`, to find the config file. An extern rather than a builtin, so
+// it has to be named here before it can be called.
+extern fn getenv: str -> str;
 extern fn io_poll_wait: int -> int -> int;
 extern fn io_poll_get: int -> int -> int;
 extern fn tcp_read: int -> int -> int -> int;
@@ -50,8 +56,51 @@ extern fn mem_copy_str: int -> int -> str -> int;
 extern fn mem_to_str: int -> int -> str;
 // shim/medit2_shim.c: a child process on one bidirectional fd.
 extern fn proc_open: str -> int;
+extern fn proc_reap: unit -> int;
 extern fn mem_alloc: int -> int;
 extern fn mem_get_u8: int -> int -> int;
+extern fn mem_set_u8: int -> int -> int -> int;
+
+// THE PROMPT IS A MODE, and it is the only one. Everything the editor asks
+// for -- a search term, a line number, a filename -- is typed on the status
+// line, so there is one place where keys mean something other than "edit".
+//
+// `origin` is where the cursor was when the prompt opened: an incremental
+// search searches from there on every keystroke rather than from wherever the
+// last match left the cursor, or deleting a character would not walk back.
+type promptkind = PSearch | PGoto | POpen;
+// `found` is what the last incremental attempt did, so ACCEPTING a search that
+// matched nothing still says so. Without it the prompt showed "(not found)"
+// while you typed and then replaced it with the term on Enter, which reads as
+// if the search had succeeded.
+type prompt = { kind: promptkind, text: str, origin: int, back: bool,
+                note: str, found: bool };
+
+// A buffer that is not on screen. It is `ed` minus everything that belongs to
+// the EDITOR rather than to a document -- the terminal size, the ambiguous
+// width, the clipboard, the prompt -- which is the whole of the distinction:
+// switching buffers must not change the size of the terminal.
+//
+// The names carry a `p_` prefix because a record field is resolved by the type
+// it is read from, and two record types with a field called `buf` differing in
+// nothing else is how a mechanical park/unpark pair becomes a silent mix-up.
+type parked = {
+  p_buf: buf,
+  p_starts: Vec[R, int],
+  p_total: int,
+  p_cur: int,
+  p_goal: int,
+  p_top: int,
+  p_path: str,
+  p_dirty: bool,
+  p_anchor: int option,
+  p_lsp: lsp,
+  p_dirty_for_lsp: bool,
+  p_jumps: int list,
+  p_toks: Vec[R, int],
+  p_ntok: int,
+  p_toks_stale: bool,
+};
 
 type ed = {
   buf: buf,
@@ -70,7 +119,55 @@ type ed = {
   // 1 normally, 2 when it is configured for CJK. The standard declines to
   // decide, so the editor is told rather than guessing (--wide).
   amb: int,
+  // Where a selection started, when there is one. The cursor is the other end,
+  // so a selection is a PAIR and not a third position -- moving the cursor
+  // extends it, and that is the whole model.
+  anchor: int option,
+  // What was last cut or copied. Kept inside the editor so paste works with no
+  // system clipboard at all; `clip_set` also pushes it outwards when it can.
+  clip: str,
+  // None when editing. Some when the status line is taking input instead.
+  prompt: prompt option,
+  // The last thing searched for, so "find next" needs no retyping.
+  last_needle: str,
   lsp: lsp,
+  // Where the cursor was before the last definition jump, so there is a way
+  // back. A list rather than one slot: following a definition to a definition
+  // is the normal way to read unfamiliar code.
+  jumps: int list,
+  // Which completion item Enter would take.
+  cmp_sel: int,
+  // What a key does. Index 0..31 is the control byte; the value is an action
+  // id. A config file changes entries in here and nothing else.
+  keymap: Vec[R, int],
+  // How wide a Tab is, in spaces. Tabs are inserted as SPACES: a piece table
+  // over a file with real tabs in it would have to answer "which column is
+  // this byte in" differently for every line, and the editor's whole display
+  // model is that a line's columns come from its own characters.
+  tabstop: int,
+  // Draw the line number gutter.
+  numbers: bool,
+  // Colour overrides from the config, as "name=sgr" entries. Empty means the
+  // built-in palette.
+  colors: (str * str) list,
+  // What the config file had to say for itself, shown once at startup. A
+  // config that is silently half-applied is worse than one that says what it
+  // could not read.
+  conf_note: str,
+  // Semantic tokens for the buffer, four ints each -- line, character, length,
+  // kind -- flat, in document order. A Vec rather than a list because the
+  // renderer indexes into it once per visible token per frame.
+  toks: Vec[R, int],
+  ntok: int,
+  // The tokens describe the text as the server last saw it. An edit makes them
+  // stale; they are re-asked for when the editor next goes idle, which is the
+  // same tick the change is sent on.
+  toks_stale: bool,
+  // The buffers that are not on screen, in cycling order: the next one is the
+  // head, and the one you are leaving goes on the end. The ACTIVE buffer is
+  // not in here -- it is the `ed` around it -- so there is exactly one place
+  // any given document's state lives.
+  others: parked list,
   // A change the server has not been told about yet. Sent when the editor goes
   // idle rather than on every keystroke: `mere lsp` syncs FULL TEXT, so a
   // keystroke-by-keystroke didChange re-sends the whole buffer per key, down
@@ -114,6 +211,46 @@ let cur_line = fn (st: ed) -> Lines.line_at st.starts st.cur;
 let line_start = fn (st: ed) -> fn (l: int) -> Lines.start_of st.starts l;
 let line_end = fn (st: ed) -> fn (l: int) -> Lines.end_of st.starts l st.total;
 let line_len = fn (st: ed) -> fn (l: int) -> line_end st l - line_start st l;
+
+let rec _count_parked = fn (xs: parked list) -> fn (n: int) ->
+  match xs with Nil -> n | Cons (_, r) -> _count_parked r (n + 1);
+
+let nbuffers = fn (st: ed) -> 1 + _count_parked st.others 0;
+
+// --- UTF-16 units, which is what the protocol counts -----------------------
+// The buffer counts bytes; LSP counts UTF-16 code units, and everything
+// outside the BMP is a surrogate PAIR -- one character, two units. These two
+// walks are the only place the difference is dealt with, and both the
+// positions sent to the server and the token spans drawn on screen go through
+// them.
+
+let rec _u16_count = fn (s: str) -> fn (i: int) -> fn (acc: int) ->
+  if i >= str_len s then acc
+  else
+    let b = ord (substring s i (i + 1)) in
+    // A continuation byte is 10xxxxxx and belongs to the character before it.
+    // A lead byte of 0xF0 or more opens a four-byte sequence, which is exactly
+    // the characters that need a surrogate pair.
+    _u16_count s (i + 1)
+      (if b / 64 == 2 then acc else if b >= 240 then acc + 2 else acc + 1);
+
+let rec _cp_skip = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then i
+  else if ord (substring s i (i + 1)) / 64 == 2 then _cp_skip s (i + 1)
+  else i;
+
+// Walk forward `k` UTF-16 units. A `k` that lands in the middle of a surrogate
+// pair stops at the next character boundary rather than inside a character.
+let rec _u16_advance = fn (s: str) -> fn (i: int) -> fn (k: int) ->
+  if k <= 0 || i >= str_len s then i
+  else
+    let units = if ord (substring s i (i + 1)) >= 240 then 2 else 1 in
+    _u16_advance s (_cp_skip s (i + 1)) (k - units);
+
+let rec _nth = fn (xs: str list) -> fn (i: int) ->
+  match xs with
+  | Nil -> ""
+  | Cons (x, r) -> if i <= 0 then x else _nth r (i - 1);
 
 let clamp = fn (x: int) -> fn (lo: int) -> fn (hi: int) ->
   if x < lo then lo else if x > hi then hi else x;
@@ -166,6 +303,60 @@ let prev_char = fn (st: ed) -> fn (off: int) ->
   else _prev_before (line_boundaries st l) off s;
 
 // Keep the cursor's line on screen. Called after every move.
+// --- word-wise movement ----------------------------------------------------
+// A "word" here is a run of identifier bytes, and the move skips whatever is
+// between one run and the next. Deliberately BYTE-wise over ASCII: Japanese
+// has no spaces, so any word rule for it is a segmentation problem and a wrong
+// answer would be worse than the honest one -- a run of non-ASCII counts as
+// one word, which is what Ctrl-arrow does in most terminal editors.
+
+let _is_wordb = fn (b: int) ->
+  (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57)
+  || b == 95 || b >= 128;
+
+let _byte_at = fn (st: ed) -> fn (off: int) ->
+  if off < 0 || off >= st.total then 0 - 1
+  else ord (Buffer.slice st.buf off 1);
+
+// Forward: leave the run you are in, then skip the gap, and stop at the start
+// of the next run. Stopping at the END of the current run instead makes
+// repeated presses alternate between two places.
+let rec _skip_word = fn (st: ed) -> fn (off: int) -> fn (want: bool) ->
+  if off >= st.total then st.total
+  else if _is_wordb (_byte_at st off) == want then _skip_word st (off + 1) want
+  else off;
+
+// The gap skip stops at a LINE END. Crossing it would make Shift+Ctrl-Right on
+// the last word of a line select the break too, and deleting the selection
+// would join two lines without anyone asking. When the cursor is already on
+// the break it steps over it, or the key would do nothing at every line end.
+let rec _skip_gap = fn (st: ed) -> fn (off: int) ->
+  if off >= st.total then st.total
+  else
+    let b = _byte_at st off in
+    if b == 10 || _is_wordb b then off else _skip_gap st (off + 1);
+
+let word_right = fn (st: ed) ->
+  let a = _skip_word st st.cur true in
+  if a == st.cur && _byte_at st a == 10 then _skip_gap st (a + 1)
+  else _skip_gap st a;
+
+let rec _skip_word_back = fn (st: ed) -> fn (off: int) -> fn (want: bool) ->
+  if off <= 0 then 0
+  else if _is_wordb (_byte_at st (off - 1)) == want then _skip_word_back st (off - 1) want
+  else off;
+
+let rec _skip_gap_back = fn (st: ed) -> fn (off: int) ->
+  if off <= 0 then 0
+  else
+    let b = _byte_at st (off - 1) in
+    if b == 10 || _is_wordb b then off else _skip_gap_back st (off - 1);
+
+let word_left = fn (st: ed) ->
+  let a = if st.cur > 0 && _byte_at st (st.cur - 1) == 10 then st.cur - 1
+          else _skip_gap_back st st.cur in
+  _skip_word_back st a true;
+
 let scroll = fn (st: ed) ->
   let l = cur_line st in
   let body = st.rows - 1 in
@@ -192,7 +383,9 @@ let move_vert = fn (st: ed) -> fn (d: int) ->
 // Each of these returns a NEW state and must run outside the redraw's region.
 
 let do_insert = fn (st: ed) -> fn (s: str) ->
-  let b = Buffer.insert st.buf st.cur s in
+  // The mark is the cursor BEFORE the edit, which is where undo should put it
+  // back. Written right after the snapshot is taken, so the two cannot drift.
+  let b = Buffer.mark (Buffer.insert st.buf st.cur s) st.cur in
   let n = str_len s in
   let l = Lines.line_at st.starts st.cur in
   // Shift every later start, then insert a start for each newline typed.
@@ -200,7 +393,7 @@ let do_insert = fn (st: ed) -> fn (s: str) ->
   let st = ({ st | buf = b, total = st.total + n } : ed) in
   // A newline changes the line structure; rebuilding is rare enough to afford.
   let st = if str_contains s (chr 10) then reindex st else st in
-  move_to ({ st | dirty = true, dirty_for_lsp = true } : ed) (st.cur + n);
+  move_to ({ st | dirty = true, dirty_for_lsp = true, toks_stale = true } : ed) (st.cur + n);
 
 // Backspace removes a whole CHARACTER, not a byte: deleting one byte of a
 // three-byte kanji leaves two bytes that are not any character at all.
@@ -210,8 +403,9 @@ let do_delete_back = fn (st: ed) ->
     let from = prev_char st st.cur in
     let n = st.cur - from in
     let removed = Buffer.slice st.buf from n in
-    let b = Buffer.delete st.buf from n in
-    let st = ({ st | buf = b, total = st.total - n, dirty = true, dirty_for_lsp = true } : ed) in
+    let b = Buffer.mark (Buffer.delete st.buf from n) st.cur in
+    let st = ({ st | buf = b, total = st.total - n, dirty = true,
+                     dirty_for_lsp = true, toks_stale = true } : ed) in
     let st = if str_contains removed (chr 10) then reindex st
              else
                let l = Lines.line_at st.starts st.cur in
@@ -221,9 +415,23 @@ let do_delete_back = fn (st: ed) ->
 
 let do_undo = fn (st: ed) ->
   if Buffer.can_undo st.buf then
-    let st = reindex ({ st | buf = Buffer.undo st.buf } : ed) in
-    move_to ({ st | msg = "undo", dirty = true, dirty_for_lsp = true } : ed) st.cur
+    // Read the mark BEFORE undoing: it belongs to the snapshot being restored.
+    let want = Buffer.mark_of st.buf in
+    let b = Buffer.mark_redo (Buffer.undo st.buf) st.cur in
+    let st = reindex ({ st | buf = b } : ed) in
+    let st = ({ st | cur = if want >= 0 then want else st.cur } : ed) in
+    move_to ({ st | msg = "undo", dirty = true, dirty_for_lsp = true, toks_stale = true } : ed) st.cur
   else ({ st | msg = "nothing to undo" } : ed);
+
+let do_redo = fn (st: ed) ->
+  if not (Buffer.can_redo st.buf) then ({ st | msg = "nothing to redo" } : ed)
+  else
+    let want = Buffer.mark_redo_of st.buf in
+    let b = Buffer.mark (Buffer.redo st.buf) st.cur in
+    let st = reindex ({ st | buf = b, total = Buffer.len b } : ed) in
+    let st = ({ st | cur = if want >= 0 then want else st.cur } : ed) in
+    move_to ({ st | msg = "redo", dirty = true, dirty_for_lsp = true,
+                    toks_stale = true, anchor = None } : ed) st.cur;
 
 let do_save = fn (st: ed) ->
   // Written in one go through the buffer, which for a huge file means reading
@@ -244,16 +452,312 @@ let do_save = fn (st: ed) ->
   let _ = run ("mv " ++ st.path ++ ".medit2.tmp " ++ st.path) in
   ({ st | dirty = false, msg = "wrote " ++ show st.total ++ " bytes" } : ed);
 
+// --- small helpers the prompt needs ----------------------------------------
+
+// `int_of_str` FAILS on anything that is not a number, and a prompt is where a
+// user types anything at all -- so the failure is caught here rather than
+// taking the editor down on a typo.
+let int_of_str_or = fn (s: str) -> fn (d: int) -> try_or (fn () -> int_of_str s) d;
+
+// One character back in a string, by UTF-8 boundary. Backspace in a prompt has
+// to remove a character and not a byte, for the same reason it does in the
+// document: a third of a kanji is not any character at all.
+let rec prev_utf8 = fn (s: str) -> fn (i: int) ->
+  if i <= 0 then 0
+  else
+    let b = ord (substring s (i - 1) i) in
+    if b >= 128 && b < 192 then prev_utf8 s (i - 1) else i - 1;
+
+// --- selection and the clipboard -------------------------------------------
+
+// Its own arena block: a paste must not land on top of a half-read LSP frame.
+let cbuf = mem_alloc 262144;
+
+
+// A selection is the span between the anchor and the cursor, in either order.
+let sel_range = fn (st: ed) ->
+  match st.anchor with
+  | None -> (st.cur, st.cur)
+  | Some (a) -> if a <= st.cur then (a, st.cur) else (st.cur, a);
+
+let has_sel = fn (st: ed) ->
+  match st.anchor with None -> false | Some (a) -> a != st.cur;
+
+let sel_text = fn (st: ed) ->
+  let r = sel_range st in
+  let n = snd r - fst r in
+  if n <= 0 then "" else Buffer.slice st.buf (fst r) n;
+
+// Starting a selection drops the anchor where the cursor is; every extend
+// after that is just a cursor move, so all the existing movement code works
+// unchanged.
+let sel_start = fn (st: ed) ->
+  match st.anchor with Some (_) -> st | None -> ({ st | anchor = Some (st.cur) } : ed);
+
+let sel_clear = fn (st: ed) -> ({ st | anchor = None } : ed);
+
+// --- the system clipboard ---------------------------------------------------
+// Through the same socketpair shim the language server uses. This is its
+// SECOND caller, which is the thing that was missing when the question of a
+// built-in process capability came up: one user cannot show what the shape of
+// that capability should be.
+//
+// Failure is silent ON PURPOSE. No pbcopy, no xclip, no Wayland -- the
+// internal register still works, and an editor that refuses to copy because
+// the machine has no clipboard tool is worse than one that quietly keeps it to
+// itself. The status line says which happened.
+let _clip_cmd_out = "command -v pbcopy >/dev/null 2>&1 && exec pbcopy; \
+command -v wl-copy >/dev/null 2>&1 && exec wl-copy; \
+command -v xclip >/dev/null 2>&1 && exec xclip -selection clipboard; \
+exec cat >/dev/null";
+
+let _clip_cmd_in = "command -v pbpaste >/dev/null 2>&1 && exec pbpaste; \
+command -v wl-paste >/dev/null 2>&1 && exec wl-paste --no-newline; \
+command -v xclip >/dev/null 2>&1 && exec xclip -selection clipboard -o; \
+exit 1";
+
+let clip_push = fn (s: str) ->
+  if str_eq s "" then false
+  else
+    let fd = proc_open _clip_cmd_out in
+    if fd < 0 then false
+    else
+      let n = mem_copy_str cbuf 0 s in
+      let w = tcp_write fd cbuf n in
+      let _ = tcp_close fd in
+      let _ = proc_reap () in
+      w >= 0;
+
+let clip_pull = fn () ->
+  let fd = proc_open _clip_cmd_in in
+  if fd < 0 then ""
+  else
+    // One read is enough for anything a person pasted by hand; a larger
+    // clipboard is truncated rather than growing the arena, and the arena is
+    // what bounds it.
+    let n = tcp_read fd cbuf 262144 in
+    let _ = tcp_close fd in
+    let _ = proc_reap () in
+    if n <= 0 then "" else mem_to_str cbuf n;
+
+// --- search and the prompt --------------------------------------------------
+
+// Move to a hit and say what happened. An editor that wraps without saying so
+// makes you think the file is shorter than it is.
+let _land_on = fn (st: ed) -> fn (hit: int) -> fn (wrapped: bool) -> fn (needle: str) ->
+  if hit < 0 then ({ st | msg = "not found: " ++ needle } : ed)
+  else move_to ({ st | msg = if wrapped then "wrapped" else "" } : ed) hit;
+
+let do_find_next = fn (st: ed) -> fn (needle: str) ->
+  if str_eq needle "" then st
+  else
+    // From the character AFTER the cursor, or "find next" would keep finding
+    // the match the cursor is already sitting on.
+    let r = Search.find_next st.buf st.total (st.cur + 1) needle in
+    _land_on ({ st | last_needle = needle } : ed) (fst r) (snd r) needle;
+
+let do_find_prev = fn (st: ed) -> fn (needle: str) ->
+  if str_eq needle "" then st
+  else
+    let r = Search.find_prev st.buf st.total st.cur needle in
+    _land_on ({ st | last_needle = needle } : ed) (fst r) (snd r) needle;
+
+// Incremental: every keystroke searches from where the prompt OPENED, so
+// deleting a character walks the match back rather than leaving the cursor
+// stranded past it.
+let _incremental = fn (st: ed) -> fn (p: prompt) ->
+  if str_eq p.text "" then move_to st p.origin
+  else
+    let r = if p.back then Search.find_prev st.buf st.total (p.origin + str_len p.text) p.text
+            else Search.find_next st.buf st.total p.origin p.text in
+    let hit = fst r in
+    if hit < 0 then
+      ({ st | prompt = Some ({ p | note = "  (not found)", found = false } : prompt) } : ed)
+    else
+      let st2 = move_to st hit in
+      ({ st2 | prompt = Some ({ p | note = if snd r then "  (wrapped)" else "",
+                                    found = true } : prompt) } : ed);
+
+let open_prompt = fn (st: ed) -> fn (k: promptkind) -> fn (back: bool) ->
+  ({ st | prompt = Some (prompt { kind = k, text = "", origin = st.cur,
+                                  back = back, note = "", found = true } : prompt),
+          msg = "" } : ed);
+
+let close_prompt = fn (st: ed) -> ({ st | prompt = None } : ed);
+
+// ESC in a prompt puts the cursor back where it started. A search you
+// abandoned should not move you.
+let cancel_prompt = fn (st: ed) ->
+  match st.prompt with
+  | None -> st
+  | Some (p) -> close_prompt (move_to ({ st | msg = "" } : ed) p.origin);
+
+// --- cut, copy, paste -------------------------------------------------------
+
+let do_copy = fn (st: ed) ->
+  let t = sel_text st in
+  if str_eq t "" then ({ st | msg = "nothing selected" } : ed)
+  else
+    let pushed = clip_push t in
+    sel_clear ({ st | clip = t,
+                      msg = show (str_len t) ++ "B copied"
+                            ++ (if pushed then "" else " (editor only)") } : ed);
+
+let do_cut = fn (st: ed) ->
+  let t = sel_text st in
+  if str_eq t "" then ({ st | msg = "nothing selected" } : ed)
+  else
+    let r = sel_range st in
+    let from = fst r in
+    let n = snd r - from in
+    let pushed = clip_push t in
+    let b = Buffer.mark (Buffer.delete st.buf from n) st.cur in
+    let st2 = reindex ({ st | buf = b, anchor = None, clip = t,
+                              dirty = true, dirty_for_lsp = true, toks_stale = true,
+                              msg = show n ++ "B cut"
+                                    ++ (if pushed then "" else " (editor only)") } : ed) in
+    move_to st2 from;
+
+// The system clipboard wins when it has something, because that is what the
+// person just copied somewhere else. The internal register is the fallback,
+// not the other way round.
+let do_paste = fn (st: ed) ->
+  let outside = clip_pull () in
+  let t = if str_eq outside "" then st.clip else outside in
+  if str_eq t "" then ({ st | msg = "clipboard is empty" } : ed)
+  else
+    // Pasting over a selection replaces it, which is what every editor does
+    // and what makes cut-paste-elsewhere one gesture rather than two.
+    let st1 = if has_sel st then
+                let r = sel_range st in
+                let b = Buffer.mark (Buffer.delete st.buf (fst r) (snd r - fst r)) st.cur in
+                let stx = reindex ({ st | buf = b, anchor = None,
+                                          dirty = true, dirty_for_lsp = true, toks_stale = true } : ed) in
+                move_to stx (fst r)
+              else st in
+    do_insert ({ st1 | msg = show (str_len t) ++ "B pasted" } : ed) t;
+
+// Backspace with a selection removes the selection, not one character.
+let do_delete_sel_or_back = fn (st: ed) ->
+  if has_sel st then
+    let r = sel_range st in
+    let b = Buffer.mark (Buffer.delete st.buf (fst r) (snd r - fst r)) st.cur in
+    let st2 = reindex ({ st | buf = b, anchor = None,
+                              dirty = true, dirty_for_lsp = true, toks_stale = true } : ed) in
+    move_to st2 (fst r)
+  else do_delete_back st;
+
 // --- rendering ------------------------------------------------------------
 // Everything below runs INSIDE the frame's region block. It must not allocate
 // anything the next frame needs -- strings only, no containers.
 
-let rec _render_rows = fn (st: ed) -> fn (l: int) -> fn (n: int) -> fn (acc: str) ->
+// A Tab is inserted as spaces, to the next multiple of `tabstop`. Inserting a
+// fixed run instead would put the text at a column that depends on where the
+// tab was typed, which is what a tab is supposed to avoid.
+let _tab_text = fn (st: ed) ->
+  let l = cur_line st in
+  let s0 = line_start st l in
+  let before = Buffer.slice st.buf s0 (st.cur - s0) in
+  let col = Width.cols_before_amb st.amb before (str_len before) in
+  let w = if st.tabstop < 1 then 1 else st.tabstop in
+  let k = w - (col % w) in
+  let rec sp = fn (i: int) -> fn (acc: str) -> if i <= 0 then acc else sp (i - 1) (acc ++ " ") in
+  sp k "";
+
+// --- the line number gutter ------------------------------------------------
+// Its width is taken from the LAST line's number, not from the numbers on
+// screen: a gutter that widened as you scrolled past line 999 would shift
+// every line of text sideways in the middle of reading.
+let _digits = fn (n: int) ->
+  let rec go = fn (x: int) -> fn (d: int) -> if x < 10 then d else go (x / 10) (d + 1) in
+  go (if n < 1 then 1 else n) 1;
+
+let gutter_width = fn (st: ed) ->
+  if not st.numbers then 0 else _digits (Lines.count st.starts) + 1;
+
+let _gutter = fn (st: ed) -> fn (l: int) -> fn (shown: bool) ->
+  let w = gutter_width st in
+  if w <= 0 then ""
+  else
+    let txt = if shown then show (l + 1) else "" in
+    let rec pad = fn (acc: str) -> if str_len acc >= w - 1 then acc else pad (" " ++ acc) in
+    esc ++ "[90m" ++ pad txt ++ esc ++ "[0m" ++ " ";
+
+// --- syntax colouring ------------------------------------------------------
+// The colours come from the SERVER, as semantic tokens: `mere lsp` says which
+// names are parameters and which are functions -- a distinction no pattern
+// over the text can make -- and, since v0.1.478, where the keywords, literals
+// and comments are, taken from the real lexer. So there is no second lexer in
+// here pretending to know Mere.
+//
+// The token stream is kept flat, four ints per token (line, character, length,
+// kind), because a file has thousands of them and the renderer walks it once
+// per frame.
+
+// The first token at or after line `l`. The renderer walks lines upward and
+// carries this index forward, so the whole stream is scanned once per frame
+// rather than once per row.
+let rec _tok_seek = fn (st: ed) -> fn (ti: int) -> fn (l: int) ->
+  if ti >= st.ntok then ti
+  else if vec_get st.toks (ti * 4) < l then _tok_seek st (ti + 1) l
+  else ti;
+
+// A kind is an INDEX into the legend the server sent; the name is what has a
+// meaning. `variable` is deliberately left uncoloured -- colouring every bound
+// name makes the screen noisy and tells you nothing, since most names on a
+// line are variables.
+let rec _pair_get = fn (xs: (str * str) list) -> fn (k: str) ->
+  match xs with
+  | Nil -> ""
+  | Cons (p, r) -> if str_eq (fst p) k then snd p else _pair_get r k;
+
+let _sgr_of = fn (st: ed) -> fn (k: int) ->
+  let name = _nth st.lsp.legend k in
+  // The config wins, and it wins by NAME rather than by index: the index is
+  // the server's numbering and means nothing outside one handshake.
+  let over = _pair_get st.colors name in
+  if not (str_eq over "") then over
+  else if str_eq name "keyword" then "35"
+  else if str_eq name "string" then "32"
+  else if str_eq name "number" then "36"
+  else if str_eq name "comment" then "90"
+  else if str_eq name "function" then "33"
+  else if str_eq name "parameter" then "34"
+  else if str_eq name "enumMember" then "95"
+  else "";
+
+// Wrap this row's tokens in colour. `shown` is the row as it will be drawn --
+// already clipped to the window -- and `at` is how far of it has been emitted.
+let rec _paint = fn (st: ed) -> fn (shown: str) -> fn (ti: int) -> fn (l: int) ->
+                 fn (at: int) -> fn (acc: str) ->
+  if ti >= st.ntok || vec_get st.toks (ti * 4) != l then
+    acc ++ substring shown at (str_len shown)
+  else
+    let ch = vec_get st.toks (ti * 4 + 1) in
+    let ln = vec_get st.toks (ti * 4 + 2) in
+    let sgr = _sgr_of st (vec_get st.toks (ti * 4 + 3)) in
+    // The token's start and length are in UTF-16 units from the line start;
+    // the row is bytes. Anything else paints Japanese source at an offset.
+    let b0 = _u16_advance shown 0 ch in
+    let b1 = _u16_advance shown b0 ln in
+    if str_eq sgr "" || b0 < at || b0 >= str_len shown then
+      // A kind this editor leaves alone, a token that overlaps one already
+      // drawn, or one off the clipped right edge.
+      _paint st shown (ti + 1) l at acc
+    else
+      _paint st shown (ti + 1) l b1
+        (acc ++ substring shown at b0 ++ esc ++ "[" ++ sgr ++ "m"
+             ++ substring shown b0 b1 ++ esc ++ "[0m");
+
+let rec _render_rows = fn (st: ed) -> fn (l: int) -> fn (n: int) -> fn (ti: int) ->
+                      fn (acc: str) ->
   if n <= 0 then acc
   else
     let nlines = Lines.count st.starts in
+    let ti2 = _tok_seek st ti l in
+    let text_cols = st.cols - gutter_width st in
     let body =
-      if l >= nlines then "~"
+      if l >= nlines then _gutter st l false ++ "~"
       else
         let s = line_start st l in
         let e = line_end st l in
@@ -261,9 +765,202 @@ let rec _render_rows = fn (st: ed) -> fn (l: int) -> fn (n: int) -> fn (acc: str
         // -- then clip by COLUMNS. Clipping by bytes puts half a kanji at the
         // right edge, and half a kanji is not something a terminal can draw:
         // it corrupts every line below it.
-        let raw = Buffer.slice st.buf s (if e - s > st.cols * 4 then st.cols * 4 else e - s) in
-        substring raw 0 (Width.take_cols_amb st.amb raw st.cols) in
-    _render_rows st (l + 1) (n - 1) (acc ++ esc ++ "[K" ++ body ++ chr 13 ++ chr 10);
+        let raw = Buffer.slice st.buf s (if e - s > text_cols * 4 then text_cols * 4 else e - s) in
+        let shown = substring raw 0 (Width.take_cols_amb st.amb raw text_cols) in
+        // A selection is drawn by splitting the line at the two ends and
+        // wrapping the middle in reverse video. Splitting at BYTES is right
+        // here because both ends are byte offsets into the same line, and
+        // `take_cols` has already made sure the line ends on a character.
+        let r = sel_range st in
+        let a = fst r in
+        let z = snd r in
+        _gutter st l true ++
+        (if not (has_sel st) || z <= s || a >= s + str_len shown then
+          // Colours, when the server has sent any. A SELECTED row is drawn in
+          // reverse video instead: both want to wrap spans of the row, and the
+          // selection's two ends are byte offsets into the UNCOLOURED string --
+          // slicing a string that already carries escape sequences by those
+          // offsets would cut one of them in half.
+          (if st.ntok == 0 then shown else _paint st shown ti2 l 0 "")
+        else
+          let lo = if a > s then a - s else 0 in
+          let hi = let h = z - s in if h > str_len shown then str_len shown else h in
+          substring shown 0 lo ++ esc ++ "[7m" ++ substring shown lo hi
+          ++ esc ++ "[0m" ++ substring shown hi (str_len shown)) in
+    _render_rows st (l + 1) (n - 1) ti2 (acc ++ esc ++ "[K" ++ body ++ chr 13 ++ chr 10);
+
+// --- positions, in the protocol's coordinates ------------------------------
+// LSP speaks (line, character), zero-based, and `character` counts UTF-16 CODE
+// UNITS. The buffer counts bytes. The two agree on ASCII and nowhere else, so
+// a hover in a file with any Japanese in it lands on the wrong token unless
+// the conversion is done here -- and the server answers about that token,
+// confidently, with nothing to show that the question was wrong.
+//
+// UTF-16 units rather than characters: everything outside the BMP is a
+// surrogate pair, so one emoji is one character and TWO units. Counting
+// characters is off by one per emoji and the error accumulates along the line.
+
+let lsp_position = fn (st: ed) ->
+  let l = cur_line st in
+  let s0 = line_start st l in
+  let before = Buffer.slice st.buf s0 (st.cur - s0) in
+  (l, _u16_count before 0 0);
+
+// The inverse. A position PAST the end clamps to the end rather than being
+// rejected: `mere lsp` returns a whole-document formatting range whose end is
+// `{line: <lines>, character: 0}` -- one line past the last one -- and so do
+// most servers. Treating that as out of range drops the only edit in the
+// reply and the editor reports "nothing to format" on a file it just
+// reformatted. A NEGATIVE line is still refused; there is no sane reading of it.
+let offset_of_pos = fn (st: ed) -> fn (line: int) -> fn (ch: int) ->
+  if line < 0 then (0 - 1)
+  else if line >= Lines.count st.starts then st.total
+  else
+    let s0 = line_start st line in
+    let txt = Buffer.slice st.buf s0 (line_end st line - s0) in
+    s0 + _u16_advance txt 0 ch;
+
+// --- the popup -------------------------------------------------------------
+// Hover text and the completion menu are drawn OVER the frame that was just
+// written, by addressing the rows they occupy. The alternative -- splicing
+// them into the screen string -- would make the renderer find row boundaries
+// in a string whose rows are already variable-length because of the escape
+// sequences in them.
+
+let popup_max = 8;
+
+let rec _split_nl = fn (s: str) -> fn (acc: str list) ->
+  let at = str_index_of s (chr 10) in
+  if at < 0 then list_rev (Cons (s, acc))
+  else _split_nl (substring s (at + 1) (str_len s)) (Cons (substring s 0 at, acc));
+
+let rec _list_len = fn (xs: str list) -> fn (n: int) ->
+  match xs with Nil -> n | Cons (_, r) -> _list_len r (n + 1);
+
+// What the popup is showing, or Nil when it is showing nothing. Completion
+// wins over hover because only one request is ever in flight, so the two
+// cannot both be current.
+// `mere lsp` returns hover text as markdown, and its answer is a fenced code
+// block: three lines, two of which are ``` . Stripping the fence is a
+// PRESENTATION decision and lives here rather than in src/lsp.mere, which
+// carries the protocol -- a client that rendered markdown would want the fence.
+let rec _unfence = fn (xs: str list) -> fn (acc: str list) ->
+  match xs with
+  | Nil -> list_rev acc
+  | Cons (x, r) -> _unfence r (if str_starts_with (str_trim x) "```" then acc else Cons (x, acc));
+
+// Where the word under the cursor starts. A completion REPLACES what has been
+// typed so far; inserting the label outright turns `str_l` + `str_len` into
+// `str_lstr_len`, which is the first thing anyone notices.
+let _is_word = fn (b: int) ->
+  (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) || b == 95;
+
+let rec _word_start = fn (st: ed) -> fn (off: int) -> fn (floor: int) ->
+  if off <= floor then off
+  else
+    let c = Buffer.slice st.buf (off - 1) 1 in
+    if _is_word (ord c) then _word_start st (off - 1) floor else off;
+
+let word_prefix = fn (st: ed) ->
+  let from = _word_start st st.cur (line_start st (cur_line st)) in
+  Buffer.slice st.buf from (st.cur - from);
+
+let rec _filter_prefix = fn (xs: str list) -> fn (pre: str) -> fn (acc: str list) ->
+  match xs with
+  | Nil -> list_rev acc
+  | Cons (x, r) ->
+    _filter_prefix r pre (if str_starts_with x pre then Cons (x, acc) else acc);
+
+// THE CLIENT FILTERS. `mere lsp` answers a completion request with every name
+// in scope and a `sortText` on each, which is what the protocol allows: the
+// server may return a superset and leave narrowing to the client, because the
+// client is the one that knows what has been typed since the request went out.
+// Taking item 0 of the raw list gives you `list_iter` when you typed `str_l`.
+//
+// Filtering here rather than when the reply arrives is what makes the menu
+// narrow as you keep typing, with no second round trip.
+let completion_items = fn (st: ed) ->
+  match st.lsp.answer with
+  | ACompl (ls) ->
+    let pre = word_prefix st in
+    if str_eq pre "" then ls else _filter_prefix ls pre Nil
+  | _ -> Nil;
+
+let popup_lines = fn (st: ed) ->
+  match st.lsp.answer with
+  | ACompl (_) -> completion_items st
+  | AHover (t) -> _unfence (_split_nl t Nil) Nil
+  | _ -> Nil;
+
+let popup_count = fn (st: ed) ->
+  let n = _list_len (popup_lines st) 0 in
+  let room = st.rows - 2 in
+  if n > popup_max then popup_max else if n > room then room else n;
+
+let has_popup = fn (st: ed) -> popup_count st > 0;
+
+// The menu narrows as you type, so the selection has to be re-clamped every
+// time it is read rather than only when it is moved.
+let popup_sel = fn (st: ed) ->
+  let k = popup_count st in
+  if k <= 0 then 0 else clamp st.cmp_sel 0 (k - 1);
+
+let rec _popup_row = fn (st: ed) -> fn (xs: str list) -> fn (i: int) ->
+                     fn (left: int) -> fn (row: int) -> fn (acc: str) ->
+  if left <= 0 then acc
+  else
+    match xs with
+    | Nil -> acc
+    | Cons (x, rest) ->
+      // The selected completion item is the one Enter would take. Hover has no
+      // selection, and `cmp_sel` stays 0 there -- which would highlight the
+      // first line of a type signature for no reason, so it is only drawn for
+      // a completion.
+      let picked = (match st.lsp.answer with | ACompl (_) -> i == popup_sel st | _ -> false) in
+      // An ASCII gutter on purpose. A box-drawing character would be prettier
+      // and is EastAsianWidth=Ambiguous, so the popup's own frame would be one
+      // column wide or two depending on the terminal -- the exact problem the
+      // --wide flag exists for, reintroduced in the editor's own chrome.
+      // take_cols_amb answers a BYTE index, not a string: it says where to cut.
+      let body = "| " ++ substring x 0 (Width.take_cols_amb st.amb x (st.cols - 2)) in
+      let line = esc ++ "[" ++ show row ++ ";1H" ++ esc ++ "[K"
+              ++ (if picked then esc ++ "[7m" ++ body ++ esc ++ "[0m" else body) in
+      _popup_row st rest (i + 1) (left - 1) (row + 1) (acc ++ line);
+
+let popup = fn (st: ed) ->
+  let k = popup_count st in
+  if k <= 0 then ""
+  // Sits directly above the status bar, which is the last row.
+  else _popup_row st (popup_lines st) 0 k (st.rows - k) "";
+
+let dismiss_popup = fn (st: ed) ->
+  ({ st | lsp = ({ st.lsp | answer = ANone } : lsp), cmp_sel = 0 } : ed);
+
+let popup_move = fn (st: ed) -> fn (d: int) ->
+  let k = popup_count st in
+  if k <= 0 then st
+  else ({ st | cmp_sel = clamp (popup_sel st + d) 0 (k - 1) } : ed);
+
+let _status_of = fn (st: ed) -> fn (l: int) -> fn (col: int) ->
+  match st.prompt with
+  | Some (p) ->
+    // The prompt REPLACES the status line rather than sharing it. Sharing
+    // meant the line you are typing on moves as the file position changes,
+    // which is exactly when you are least able to read it.
+    let label = match p.kind with
+                | PSearch -> if p.back then "?" else "/"
+                | PGoto -> "line: "
+                | POpen -> "open: " in
+    label ++ p.text ++ p.note
+  | None ->
+    esc ++ "[7m" ++ st.path ++ (if st.dirty then " *" else "")
+    ++ (let n = nbuffers st in if n > 1 then "  [" ++ show n ++ " buf]" else "")
+    ++ "  L" ++ show (l + 1) ++ "/" ++ show (Lines.count st.starts)
+    ++ " C" ++ show (col + 1)
+    ++ "  " ++ show st.total ++ "B"
+    ++ (if str_eq st.msg "" then "" else "  " ++ st.msg)
+    ++ (let d = Lsp.status st.lsp in if str_eq d "" then "" else "  [" ++ d ++ "]")
+    ++ esc ++ "[0m";
 
 let render = fn (st: ed) ->
   let l = cur_line st in
@@ -272,18 +969,20 @@ let render = fn (st: ed) ->
   // before it counts twice and every combining mark counts nothing.
   let before = Buffer.slice st.buf s0 (st.cur - s0) in
   let col = Width.cols_before_amb st.amb before (str_len before) in
-  let status =
-    esc ++ "[7m" ++ st.path ++ (if st.dirty then " *" else "")
-    ++ "  L" ++ show (l + 1) ++ "/" ++ show (Lines.count st.starts)
-    ++ " C" ++ show (col + 1)
-    ++ "  " ++ show st.total ++ "B"
-    ++ (if str_eq st.msg "" then "" else "  " ++ st.msg)
-    ++ (let d = Lsp.status st.lsp in if str_eq d "" then "" else "  [" ++ d ++ "]")
-    ++ esc ++ "[0m" in
-  let screen = _render_rows st st.top (st.rows - 1) "" in
-  // Cursor to (row, col) in 1-based terminal coordinates.
-  let place = esc ++ "[" ++ show (l - st.top + 1) ++ ";" ++ show (col + 1) ++ "H" in
-  esc ++ "[H" ++ screen ++ status ++ place;
+  let status = _status_of st l col in
+  let screen = _render_rows st st.top (st.rows - 1) 0 "" in
+  // Cursor to (row, col) in 1-based terminal coordinates -- or to the end of
+  // the prompt, because a cursor that stays in the document while you type on
+  // the status line is a cursor in the wrong place.
+  let place =
+    match st.prompt with
+    | Some (p) ->
+      let plen = Width.of_str_amb st.amb (_status_of st l col) in
+      esc ++ "[" ++ show st.rows ++ ";" ++ show (plen + 1) ++ "H"
+    | None ->
+      esc ++ "[" ++ show (l - st.top + 1) ++ ";"
+      ++ show (col + 1 + gutter_width st) ++ "H" in
+  esc ++ "[H" ++ screen ++ status ++ popup st ++ place;
 
 // --- input ----------------------------------------------------------------
 // One read of everything waiting, then decode. Reading a byte at a time cannot
@@ -292,47 +991,158 @@ let render = fn (st: ed) ->
 let kbuf = mem_alloc 4096;
 let lbuf = mem_alloc 262144;
 
-let rec _apply = fn (st: ed) -> fn (i: int) -> fn (n: int) ->
-  if i >= n then st
-  else
-    let c = mem_get_u8 kbuf i in
-    if c == 17 then ({ st | quit = true } : ed)                 // Ctrl-Q
-    else if c == 19 then _apply (do_save st) (i + 1) n          // Ctrl-S
-    else if c == 26 then _apply (do_undo st) (i + 1) n          // Ctrl-Z
-    else if c == 127 then _apply (do_delete_back st) (i + 1) n  // Backspace
-    else if c == 13 then _apply (do_insert st (chr 10)) (i + 1) n
-    else if c == 27 then
-      // ESC [ A/B/C/D, and ESC alone when nothing follows.
-      if i + 2 < n then
-        if mem_get_u8 kbuf (i + 1) == 91 then
-          let d = mem_get_u8 kbuf (i + 2) in
-          let st2 = if d == 65 then move_vert st (0 - 1)
-                    else if d == 66 then move_vert st 1
-                    else if d == 67 then move_to st (next_char st st.cur)
-                    else if d == 68 then move_to st (prev_char st st.cur)
-                    else st in
-          _apply st2 (i + 3) n
-        else _apply st (i + 2) n
-      else st
-    else if c < 32 then _apply st (i + 1) n
-    else
-      // A run of printable bytes goes in as one insert, so a paste is one edit
-      // and one undo step rather than one per byte.
-      let rec run_end = fn (j: int) ->
-        if j >= n then j
-        else let d = mem_get_u8 kbuf j in
-             if d >= 32 && d != 127 then run_end (j + 1) else j in
-      let e = run_end i in
-      let rec gather = fn (j: int) -> fn (acc: str) ->
-        if j >= e then acc else gather (j + 1) (acc ++ chr (mem_get_u8 kbuf j)) in
-      _apply (do_insert st (gather i "")) e n;
-
-// --- the loop -------------------------------------------------------------
+// A run of printable bytes, as one string. A paste arrives as one edit and one
+// undo step rather than one per byte, and a prompt takes it the same way.
+// The readiness set. Declared beside the buffers rather than with the loop
+// because opening a buffer registers its server's fd here, and opening a
+// buffer is something a keystroke does.
 let poll = io_poll_new 0;
 let _ = io_poll_add poll 0 1;
 
+// --- buffers ---------------------------------------------------------------
+
+// Everything opening a file involves, in one place: the piece table over the
+// file, its line index, and its own language server when it is a small enough
+// source file to deserve one.
+let open_doc = fn (path: str) ->
+  let _ = if file_exists path then () else write_file path "" in
+  let sz = file_size path in
+  let f = file_openrw path in
+  let o = Disk ((f, sz)) in
+  // A language server is attached to SOURCE files only, and small ones.
+  // `mere lsp` syncs full text, so pointing it at the 208 MB file this editor
+  // exists to open would re-send 208 MB on every idle tick. The two axes do
+  // not overlap and the editor should not pretend they do.
+  let want_lsp = str_ends_with path ".mere" && sz < 1048576 in
+  let lfd = if want_lsp then proc_open "mere lsp" else (0 - 1) in
+  let _ = if lfd >= 0 then io_poll_add poll lfd 1 else 0 in
+  let l0 = Lsp.connect lfd in
+  let l0 = if lfd < 0 then l0
+           else
+             let hi = Lsp.hello l0 path (read_file path) in
+             let n = mem_copy_str lbuf 0 (fst hi) in
+             let w = tcp_write lfd lbuf n in
+             if w < 0 then ({ (snd hi) | alive = false } : lsp) else snd hi in
+  (parked { p_buf = Buffer.of_origin o, p_starts = Lines.index_of o,
+            p_total = sz, p_cur = 0, p_goal = 0, p_top = 0, p_path = path,
+            p_dirty = false, p_anchor = None, p_lsp = l0,
+            p_dirty_for_lsp = false, p_jumps = Nil,
+            p_toks = vec_new (), p_ntok = 0,
+            p_toks_stale = lfd >= 0 } : parked);
+
+// Parking clears the pending ANSWER as well as the request: come back to this
+// buffer in ten minutes and a hover from before you left would still be on
+// screen, describing a position the cursor is no longer at.
+let park = fn (st: ed) ->
+  (parked { p_buf = st.buf, p_starts = st.starts, p_total = st.total,
+            p_cur = st.cur, p_goal = st.goal, p_top = st.top, p_path = st.path,
+            p_dirty = st.dirty, p_anchor = st.anchor,
+            p_lsp = ({ st.lsp | answer = ANone, req_want = WNone, note = "" } : lsp),
+            p_dirty_for_lsp = st.dirty_for_lsp, p_jumps = st.jumps,
+            p_toks = st.toks, p_ntok = st.ntok,
+            p_toks_stale = st.toks_stale } : parked);
+
+let unpark = fn (st: ed) -> fn (p: parked) ->
+  scroll ({ st | buf = p.p_buf, starts = p.p_starts, total = p.p_total,
+                 cur = p.p_cur, goal = p.p_goal, top = p.p_top, path = p.p_path,
+                 dirty = p.p_dirty, anchor = p.p_anchor, lsp = p.p_lsp,
+                 dirty_for_lsp = p.p_dirty_for_lsp, jumps = p.p_jumps,
+                 toks = p.p_toks, ntok = p.p_ntok, toks_stale = p.p_toks_stale,
+                 cmp_sel = 0, prompt = None } : ed);
+
+let rec _append = fn (xs: parked list) -> fn (x: parked) ->
+  match xs with
+  | Nil -> Cons (x, Nil)
+  | Cons (y, r) -> Cons (y, _append r x);
+
+// A rotation rather than an index: the one being left goes to the back, so the
+// order is stable and "next" always means the same thing.
+let next_buffer = fn (st: ed) ->
+  match st.others with
+  | Nil -> ({ st | msg = "only one buffer" } : ed)
+  | Cons (p, rest) ->
+    let me = park st in
+    let st2 = unpark ({ st | others = _append rest me } : ed) p in
+    ({ st2 | msg = p.p_path } : ed);
+
+// Opening puts the new buffer on screen and parks the current one at the FRONT
+// of the ring, so the next switch goes back to where you came from.
+let open_buffer = fn (st: ed) -> fn (path: str) ->
+  if str_eq (str_trim path) "" then ({ st | msg = "no path" } : ed)
+  else
+    let me = park st in
+    let st2 = unpark ({ st | others = Cons (me, st.others) } : ed) (open_doc (str_trim path)) in
+    ({ st2 | msg = "opened " ++ str_trim path } : ed);
+
+// Closing refuses to throw away unsaved work. It does not offer to save: an
+// editor that writes a file because you pressed a key next to the one you
+// meant is worse than one that says no.
+let close_buffer = fn (st: ed) ->
+  if st.dirty then ({ st | msg = "unsaved changes -- Ctrl-S first" } : ed)
+  else
+    match st.others with
+    | Nil -> ({ st | msg = "the last buffer cannot be closed -- Ctrl-Q quits" } : ed)
+    | Cons (p, rest) ->
+      // The fd leaves the readiness set BEFORE it is closed: poll(2) on a
+      // closed descriptor reports POLLNVAL forever and the loop spins.
+      let _ = if st.lsp.alive then let _ = io_poll_del poll st.lsp.fd in
+                                   tcp_close st.lsp.fd
+              else () in
+      let st2 = unpark ({ st | others = rest } : ed) p in
+      ({ st2 | msg = "closed" } : ed);
+
+// --- the prompt, once there is somewhere to open a file INTO ---------------
+// These live below the buffer functions rather than beside the rest of the
+// prompt because accepting an `open:` prompt opens a buffer, and a buffer
+// cannot be opened before there is a readiness set to register its server in.
+
+let accept_prompt = fn (st: ed) ->
+  match st.prompt with
+  | None -> st
+  | Some (p) ->
+    match p.kind with
+    | PSearch ->
+      close_prompt ({ st | last_needle = p.text,
+                           msg = if str_eq p.text "" then ""
+                                 else if not p.found then "not found: " ++ p.text
+                                 else "/" ++ p.text } : ed)
+    | PGoto ->
+      let l = int_of_str_or p.text (0 - 1) in
+      if l < 1 then close_prompt ({ st | msg = "not a line number: " ++ p.text } : ed)
+      else
+        let nl = Lines.count st.starts in
+        let want = if l > nl then nl else l in
+        close_prompt (move_to ({ st | msg = "" } : ed) (line_start st (want - 1)))
+    | POpen -> open_buffer (close_prompt st) p.text;
+
+// A key while the prompt is open. Returns the new state; the caller has
+// already decided this byte belongs to the prompt.
+let prompt_key = fn (st: ed) -> fn (p: prompt) -> fn (c: int) ->
+  if c == 13 then accept_prompt st
+  else if c == 7 then cancel_prompt st                    // Ctrl-G
+  else if c == 127 then
+    let t = p.text in
+    let t2 = if str_len t <= 0 then t else substring t 0 (prev_utf8 t (str_len t)) in
+    let p2 = ({ p | text = t2, note = "", found = true } : prompt) in
+    let st2 = ({ st | prompt = Some p2 } : ed) in
+    // Only a search runs as you type. A file is opened when you say so: a
+    // prompt that opened `/e`, `/et`, `/etc` on the way to `/etc/hosts` would
+    // open three buffers for one file.
+    (match p.kind with PSearch -> _incremental st2 p2 | PGoto -> st2 | POpen -> st2)
+  else st;
+
+// Printable text typed into the prompt, as a run.
+let prompt_text = fn (st: ed) -> fn (p: prompt) -> fn (s: str) ->
+  let t = p.text ++ s in
+  let p2 = ({ p | text = t, note = "", found = true } : prompt) in
+  let st2 = ({ st | prompt = Some p2 } : ed) in
+  match p.kind with PSearch -> _incremental st2 p2 | PGoto -> st2 | POpen -> st2;
+
+// --- asking the language server -------------------------------------------
+
 // Tell the server what the buffer says now. Called when the editor goes idle,
-// not per keystroke.
+// and before every question: an answer about text the server has not been sent
+// is an answer about a different file.
 let push_change = fn (st: ed) ->
   if not st.lsp.alive || not st.dirty_for_lsp then st
   else
@@ -343,10 +1153,479 @@ let push_change = fn (st: ed) ->
     if w < 0 then ({ st | lsp = ({ st.lsp | alive = false } : lsp), dirty_for_lsp = false } : ed)
     else ({ st | lsp = ({ st.lsp | version = v } : lsp), dirty_for_lsp = false } : ed);
 
-let read_lsp = fn (st: ed) ->
-  let n = tcp_read st.lsp.fd lbuf 262144 in
-  if n <= 0 then ({ st | lsp = ({ st.lsp | alive = false } : lsp) } : ed)
-  else ({ st | lsp = Lsp.feed st.lsp (mem_to_str lbuf n) } : ed);
+// `Lsp.request` returns the bytes and the new client state together, because
+// the id it allocated has to be remembered by whoever sends it.
+let _send = fn (st: ed) -> fn (msg: str) -> fn (l2: lsp) ->
+  let n = mem_copy_str lbuf 0 msg in
+  let w = tcp_write st.lsp.fd lbuf n in
+  ({ st | lsp = (if w < 0 then ({ l2 | alive = false } : lsp) else l2),
+          cmp_sel = 0 } : ed);
+
+let ask_at = fn (st: ed) -> fn (method: str) -> fn (w: want) ->
+  if not st.lsp.alive then ({ st | msg = "no language server" } : ed)
+  else
+    let st = push_change st in
+    let p = lsp_position st in
+    let r = Lsp.request st.lsp st.path method (Lsp.at_position (fst p) (snd p)) w in
+    _send st (fst r) (snd r);
+
+// Highlighting refreshes itself. Nobody presses a key for it, which is why it
+// is the one request the editor makes on its own -- and why it must not step
+// on one the user DID ask for: `Lsp.request` clears the pending answer, so
+// asking while a hover or a completion menu is open would make it vanish.
+let ask_tokens = fn (st: ed) ->
+  if not st.lsp.alive || has_popup st then st
+  else
+    match st.lsp.req_want with
+    | WNone ->
+      let st = push_change st in
+      let r = Lsp.request st.lsp st.path "textDocument/semanticTokens/full" ""
+                WTokens in
+      // Not `_send`: that resets the completion selection, and this request is
+      // not one the user made.
+      let n = mem_copy_str lbuf 0 (fst r) in
+      let w = tcp_write st.lsp.fd lbuf n in
+      ({ st | lsp = (if w < 0 then ({ (snd r) | alive = false } : lsp) else snd r) } : ed)
+    | _ -> st;
+
+let ask_format = fn (st: ed) ->
+  if not st.lsp.alive then ({ st | msg = "no language server" } : ed)
+  else
+    let st = push_change st in
+    let r = Lsp.request st.lsp st.path "textDocument/formatting"
+              Lsp.format_options WFormat in
+    _send st (fst r) (snd r);
+
+// --- acting on an answer ---------------------------------------------------
+
+let accept_completion = fn (st: ed) ->
+  match st.lsp.answer with
+  | ACompl (_) ->
+    let label = _nth (completion_items st) (popup_sel st) in
+    if str_eq label "" then dismiss_popup st
+    else
+      let from = _word_start st st.cur (line_start st (cur_line st)) in
+      let st1 = if from < st.cur then
+                  let b = Buffer.mark (Buffer.delete st.buf from (st.cur - from)) st.cur in
+                  move_to ({ st | buf = b, total = Buffer.len b } : ed) from
+                else st in
+      dismiss_popup (do_insert st1 label)
+  | _ -> st;
+
+
+
+let rec _push_toks = fn (v: Vec[R, int]) -> fn (ns: int list) -> fn (n: int) ->
+  match ns with
+  | Nil -> n
+  | Cons (x, r) -> let _ = vec_push v x in _push_toks v r (n + 1);
+
+// A whole new vector rather than reusing the old one: the reply describes the
+// whole file, so there is nothing of the previous set worth keeping, and
+// growing one in place would keep the high-water mark of the largest file this
+// buffer ever held.
+let take_tokens = fn (st: ed) -> fn (ns: int list) ->
+  let v = vec_new () in
+  let total = _push_toks v ns 0 in
+  ({ st | toks = v, ntok = total / 4, toks_stale = false,
+          lsp = ({ st.lsp | answer = ANone, note = "" } : lsp) } : ed);
+
+let jump_to = fn (st: ed) -> fn (uri: str) -> fn (line: int) -> fn (ch: int) ->
+  // One buffer, for now: a definition in another file is reported rather than
+  // silently ignored, and opening it is what a second buffer would add.
+  if not (str_eq uri (Lsp.uri_of st.path)) then
+    ({ st | msg = "definition is in " ++ uri } : ed)
+  else
+    let off = offset_of_pos st line ch in
+    if off < 0 then ({ st | msg = "definition is outside this buffer" } : ed)
+    else move_to ({ st | jumps = Cons (st.cur, st.jumps),
+                         anchor = None, msg = "jumped" } : ed) off;
+
+let jump_back = fn (st: ed) ->
+  match st.jumps with
+  | Nil -> ({ st | msg = "no jump to return from" } : ed)
+  | Cons (off, rest) -> move_to ({ st | jumps = rest, msg = "back" } : ed) off;
+
+// A TextEdit's positions all refer to the document as the SERVER saw it, so
+// every offset is resolved before anything is applied, and the edits are then
+// applied from the end backwards. Applying them forwards would shift every
+// position after the first one.
+type redit = { at: int, upto: int, text: str };
+
+let rec _ins_desc = fn (x: redit) -> fn (xs: redit list) ->
+  match xs with
+  | Nil -> Cons (x, Nil)
+  | Cons (y, r) -> if x.at >= y.at then Cons (x, xs) else Cons (y, _ins_desc x r);
+
+let rec _resolve = fn (st: ed) -> fn (es: tedit list) -> fn (acc: redit list) ->
+  match es with
+  | Nil -> acc
+  | Cons (e, r) ->
+    let a = offset_of_pos st e.sl e.sc in
+    let z = offset_of_pos st e.el e.ec in
+    // An edit the buffer cannot place is dropped rather than applied at a
+    // guessed offset: a formatter that rewrites the wrong range is worse than
+    // one that does nothing.
+    _resolve st r (if a < 0 || z < a then acc
+                   else _ins_desc ((redit { at = a, upto = z, text = e.text }) : redit) acc);
+
+let rec _apply_resolved = fn (st: ed) -> fn (es: redit list) ->
+  match es with
+  | Nil -> st
+  | Cons (e, r) ->
+    let b = Buffer.delete st.buf e.at (e.upto - e.at) in
+    let b2 = Buffer.insert b e.at e.text in
+    _apply_resolved ({ st | buf = b2, total = Buffer.len b2 } : ed) r;
+
+let rec _count_redits = fn (es: redit list) -> fn (n: int) ->
+  match es with Nil -> n | Cons (_, r) -> _count_redits r (n + 1);
+
+let apply_edits = fn (st: ed) -> fn (es: tedit list) ->
+  let rs = _resolve st es Nil in
+  let n = _count_redits rs 0 in
+  if n == 0 then ({ st | msg = "nothing to format" } : ed)
+  else
+    let st2 = _apply_resolved st rs in
+    // The whole index is rebuilt rather than shifted: formatting moves line
+    // starts everywhere, and this path only runs on the small files a server
+    // is attached to at all.
+    let st3 = reindex ({ st2 | dirty = true, dirty_for_lsp = true, toks_stale = true,
+                               anchor = None,
+                               msg = "formatted (" ++ show n ++ ")" } : ed) in
+    move_to st3 st3.cur;
+
+let _run_end = fn (n: int) -> fn (i: int) ->
+  let rec go = fn (j: int) ->
+    if j >= n then j
+    else let d = mem_get_u8 kbuf j in
+         if d >= 32 && d != 127 then go (j + 1) else j in
+  go i;
+
+let _gather = fn (i: int) -> fn (e: int) ->
+  let rec go = fn (j: int) -> fn (acc: str) ->
+    if j >= e then acc else go (j + 1) (acc ++ chr (mem_get_u8 kbuf j)) in
+  go i "";
+
+// --- what a key DOES, as a number --------------------------------------------
+// The dispatch below used to be a chain of `c == 19`, and every binding was a
+// literal buried in it. With a table, a key is an INDEX and its action is the
+// value -- which is what makes `[keys]` in the config a two-line change
+// instead of a parser that rewrites the chain.
+//
+// Only control bytes are in the table: 0..31 is the whole space a single
+// keystroke can name without a modifier the terminal cannot report.
+
+let a_none = 0;
+let a_quit = 1;      let a_save = 2;      let a_undo = 3;
+let a_search = 4;    let a_search_back = 5; let a_goto = 6;
+let a_next = 7;      let a_prev = 8;
+let a_copy = 9;      let a_cut = 10;      let a_paste = 11;  let a_mark = 12;
+let a_hover = 13;    let a_def = 14;      let a_complete = 15;
+let a_format = 16;   let a_back = 17;
+let a_nextbuf = 18;  let a_open = 19;     let a_closebuf = 20;
+let a_enter = 21;    let a_tab = 22;      let a_redo = 23;
+
+// The name a config file uses for each action, in action order. One list, so
+// there is no way to add an action that the config cannot name and no way for
+// the two spellings to drift apart.
+let action_names =
+  Cons ("", Cons ("quit", Cons ("save", Cons ("undo",
+  Cons ("search", Cons ("search-back", Cons ("goto",
+  Cons ("find-next", Cons ("find-prev",
+  Cons ("copy", Cons ("cut", Cons ("paste", Cons ("mark",
+  Cons ("hover", Cons ("definition", Cons ("complete",
+  Cons ("format", Cons ("jump-back",
+  Cons ("next-buffer", Cons ("open", Cons ("close-buffer",
+  Cons ("enter", Cons ("tab", Cons ("redo", Nil))))))))))))))))))))))));
+
+let rec _index_of_name = fn (xs: str list) -> fn (name: str) -> fn (i: int) ->
+  match xs with
+  | Nil -> (0 - 1)
+  | Cons (x, r) -> if str_eq x name then i else _index_of_name r name (i + 1);
+
+let default_keymap = fn () ->
+  let v = vec_new () in
+  let rec fill = fn (i: int) -> if i >= 32 then () else
+    let _ = vec_push v a_none in fill (i + 1) in
+  let _ = fill 0 in
+  let _ = vec_set v 17 a_quit in          // Ctrl-Q
+  let _ = vec_set v 19 a_save in          // Ctrl-S
+  let _ = vec_set v 26 a_undo in          // Ctrl-Z
+  let _ = vec_set v 25 a_paste in         // Ctrl-Y
+  let _ = vec_set v 6 a_search in         // Ctrl-F
+  let _ = vec_set v 18 a_search_back in   // Ctrl-R
+  let _ = vec_set v 7 a_goto in           // Ctrl-G
+  let _ = vec_set v 14 a_next in          // Ctrl-N
+  let _ = vec_set v 16 a_prev in          // Ctrl-P
+  let _ = vec_set v 23 a_copy in          // Ctrl-W
+  let _ = vec_set v 11 a_cut in           // Ctrl-K
+  let _ = vec_set v 1 a_mark in           // Ctrl-A
+  let _ = vec_set v 20 a_hover in         // Ctrl-T
+  let _ = vec_set v 4 a_def in            // Ctrl-D
+  let _ = vec_set v 0 a_complete in       // Ctrl-Space
+  let _ = vec_set v 12 a_format in        // Ctrl-L
+  let _ = vec_set v 2 a_back in           // Ctrl-B
+  let _ = vec_set v 24 a_nextbuf in       // Ctrl-X
+  let _ = vec_set v 15 a_open in          // Ctrl-O
+  let _ = vec_set v 21 a_closebuf in      // Ctrl-U
+  let _ = vec_set v 5 a_redo in           // Ctrl-E
+  let _ = vec_set v 13 a_enter in         // Enter
+  let _ = vec_set v 9 a_tab in            // Tab
+  v;
+
+let action_of = fn (st: ed) -> fn (c: int) ->
+  if c < 0 || c >= 32 then a_none else vec_get st.keymap c;
+
+// --- the config file ---------------------------------------------------------
+// `~/.medit2.toml`, and nothing if it is not there. Reading it is deliberately
+// TOTAL: a config with a typo in it costs you the line with the typo and a
+// message saying so, never the editor. An editor that will not start because
+// of its own dotfile is an editor you cannot fix the dotfile with.
+//
+//     wide = true            # this terminal draws Ambiguous width as 2
+//     tabstop = 4
+//     line_numbers = true
+//
+//     [color]
+//     keyword = "35"
+//     comment = "90"
+//
+//     [keys]
+//     save = "C-s"
+//     redo = "C-e"
+
+let config_path = fn () ->
+  let h = getenv "HOME" in
+  if str_eq h "" then "" else h ++ "/.medit2.toml";
+
+let _conf_bool = fn (doc: (str * toml_value) list) -> fn (key: str) -> fn (d: bool) ->
+  if not (Toml.has doc key) then d
+  else match Toml.get doc key with
+       | TBool (b) -> b
+       // A number is accepted for a flag because people write `wide = 1`, and
+       // refusing it teaches nothing.
+       | TInt (n) -> n != 0
+       | _ -> d;
+
+let _conf_int = fn (doc: (str * toml_value) list) -> fn (key: str) -> fn (d: int) ->
+  if not (Toml.has doc key) then d
+  else match Toml.get doc key with | TInt (n) -> n | _ -> d;
+
+// `C-s`, `C-space`, or a bare letter meaning the control version of it. The
+// control byte of a letter is its position in the alphabet, which is what the
+// terminal actually sends.
+let key_byte = fn (spec: str) ->
+  let t = str_trim spec in
+  let low = to_lower t in
+  if str_eq low "c-space" || str_eq low "ctrl-space" then 0
+  else if str_eq low "tab" then 9
+  else if str_eq low "enter" || str_eq low "return" then 13
+  // Named so that the refusal below can NAME it. Without this spelling nothing
+  // `key_byte` can return is 27, and the branch that explains why Esc cannot
+  // be bound would never run -- it would report "unknown key esc" instead,
+  // which is true and answers a different question.
+  else if str_eq low "esc" || str_eq low "escape" then 27
+  else
+    let letter =
+      if str_starts_with low "c-" then substring low 2 (str_len low)
+      else if str_starts_with low "ctrl-" then substring low 5 (str_len low)
+      else low in
+    if str_len letter != 1 then (0 - 1)
+    else
+      let b = ord letter in
+      if b >= 97 && b <= 122 then b - 96 else (0 - 1);
+
+let rec _apply_keys = fn (doc: (str * toml_value) list) -> fn (v: Vec[R, int]) ->
+                      fn (names: str list) -> fn (i: int) -> fn (note: str) ->
+  match names with
+  | Nil -> note
+  | Cons (name, rest) ->
+    let key = "keys." ++ name in
+    if str_eq name "" || not (Toml.has doc key) then
+      _apply_keys doc v rest (i + 1) note
+    else
+      match Toml.get doc key with
+      | TStr (spec) ->
+        let b = key_byte spec in
+        // ESC is refused BY NAME: it is the first byte of every arrow key, so
+        // binding an action to it would make every arrow press do that action
+        // whenever the chunk happened to split there. That is a bug the user
+        // could not diagnose, so the config says no instead.
+        if b == 27 then
+          _apply_keys doc v rest (i + 1) (note ++ " [" ++ name ++ ": Esc cannot be bound]")
+        else if b < 0 || b > 31 then
+          _apply_keys doc v rest (i + 1) (note ++ " [" ++ name ++ ": unknown key " ++ spec ++ "]")
+        else
+          // The old binding of this action is cleared, so `save = "C-e"` moves
+          // it rather than answering to both keys.
+          let rec clear = fn (j: int) ->
+            if j >= 32 then () else
+            let _ = if vec_get v j == i then vec_set v j a_none else () in
+            clear (j + 1) in
+          let _ = clear 0 in
+          // Taking a key from another action is allowed and is REPORTED: the
+          // action that lost it now has no key at all, and finding that out by
+          // pressing it and getting nothing is the worst way to find out.
+          let taken = vec_get v b in
+          let note2 = if taken == a_none || taken == i then note
+                      else note ++ " [" ++ name ++ " took the key from "
+                           ++ _nth action_names taken ++ "]" in
+          let _ = vec_set v b i in
+          _apply_keys doc v rest (i + 1) note2
+      | _ -> _apply_keys doc v rest (i + 1) (note ++ " [" ++ name ++ ": not a string]");
+
+let rec _apply = fn (st: ed) -> fn (i: int) -> fn (n: int) ->
+  if i >= n then st
+  else
+    let c = mem_get_u8 kbuf i in
+    // THE PROMPT TAKES THE KEY FIRST. Only Ctrl-Q is still the editor's, so a
+    // prompt can never be a place you cannot leave.
+    match st.prompt with
+    | Some (p) ->
+      if action_of st c == a_quit then ({ st | quit = true } : ed)
+      else if c == 27 then
+        // ESC cancels -- but ESC is also the first byte of an arrow key. The
+        // difference is whether anything follows it IN THIS CHUNK, which is
+        // readable because the whole chunk is read at once. A byte-at-a-time
+        // reader needs a timer for this and gets it wrong at 50 ms.
+        if i + 2 < n && mem_get_u8 kbuf (i + 1) == 91 then _apply st (i + 3) n
+        else _apply (cancel_prompt st) (i + 1) n
+      else if c >= 32 && c != 127 then
+        let e = _run_end n i in
+        _apply (prompt_text st p (_gather i e)) e n
+      else _apply (prompt_key st p c) (i + 1) n
+    | None ->
+    let act = action_of st c in
+    if act == a_quit then ({ st | quit = true } : ed)
+    // THE POPUP TAKES ENTER AND TAB, and only those. A menu that swallowed
+    // every key would be a mode you cannot type your way out of; typing more
+    // letters should narrow what you were completing, so every other key falls
+    // through and the popup goes away on its own.
+    else if (act == a_enter || act == a_tab) && has_popup st then
+      _apply (accept_completion st) (i + 1) n
+    else if act == a_hover then
+      _apply (ask_at st "textDocument/hover" WHover) (i + 1) n
+    else if act == a_def then
+      _apply (ask_at st "textDocument/definition" WDefinition) (i + 1) n
+    else if act == a_complete then
+      _apply (ask_at st "textDocument/completion" WComplete) (i + 1) n
+    else if act == a_format then _apply (ask_format st) (i + 1) n
+    else if act == a_back then _apply (jump_back st) (i + 1) n
+    else if act == a_nextbuf then _apply (next_buffer st) (i + 1) n
+    else if act == a_open then _apply (open_prompt st POpen false) (i + 1) n
+    else if act == a_closebuf then _apply (close_buffer st) (i + 1) n
+    else if act == a_save then _apply (do_save st) (i + 1) n
+    else if act == a_undo then _apply (do_undo st) (i + 1) n
+    else if act == a_redo then _apply (do_redo st) (i + 1) n
+    else if act == a_search then _apply (open_prompt st PSearch false) (i + 1) n
+    else if act == a_search_back then _apply (open_prompt st PSearch true) (i + 1) n
+    else if act == a_goto then _apply (open_prompt st PGoto false) (i + 1) n
+    else if act == a_next then _apply (do_find_next st st.last_needle) (i + 1) n
+    else if act == a_prev then _apply (do_find_prev st st.last_needle) (i + 1) n
+    else if act == a_copy then _apply (do_copy st) (i + 1) n
+    else if act == a_cut then _apply (do_cut st) (i + 1) n
+    else if act == a_paste then _apply (do_paste st) (i + 1) n
+    else if act == a_mark then _apply (sel_start st) (i + 1) n
+    else if c == 127 then _apply (do_delete_sel_or_back st) (i + 1) n  // Backspace
+    else if act == a_enter then _apply (do_insert (sel_clear st) (chr 10)) (i + 1) n
+    else if act == a_tab then _apply (do_insert (sel_clear st) (_tab_text st)) (i + 1) n
+    else if c == 27 && i + 1 >= n && has_popup st then dismiss_popup st
+    else if c == 27 then
+      // ESC [ A/B/C/D for the arrows, and ESC [ 1 ; 2 <A-D> for shifted ones,
+      // which is what extends a selection. Six bytes rather than three, so the
+      // decoder has to look at the length before the letter -- reading the
+      // third byte and stopping would take `1` for a movement key.
+      // ESC [ 1 ; <mod> <letter>: 2 is Shift, 5 is Ctrl, 6 is both. Shift
+      // extends the selection, Ctrl moves by word, and the two compose --
+      // which is why the modifier is read as a number rather than matched
+      // against the one value the selection code needed.
+      if i + 5 < n && mem_get_u8 kbuf (i + 1) == 91
+         && mem_get_u8 kbuf (i + 2) == 49 && mem_get_u8 kbuf (i + 3) == 59
+         && (mem_get_u8 kbuf (i + 4) == 50 || mem_get_u8 kbuf (i + 4) == 53
+             || mem_get_u8 kbuf (i + 4) == 54) then
+        let m = mem_get_u8 kbuf (i + 4) in
+        let d = mem_get_u8 kbuf (i + 5) in
+        let shifted = m == 50 || m == 54 in
+        let worded = m == 53 || m == 54 in
+        let base = if shifted then sel_start st else sel_clear st in
+        let st2 = if d == 65 then move_vert base (0 - 1)
+                  else if d == 66 then move_vert base 1
+                  else if d == 67 then
+                    move_to base (if worded then word_right base else next_char base base.cur)
+                  else if d == 68 then
+                    move_to base (if worded then word_left base else prev_char base base.cur)
+                  else st in
+        _apply st2 (i + 6) n
+      else if i + 2 < n then
+        if mem_get_u8 kbuf (i + 1) == 91 then
+          let d = mem_get_u8 kbuf (i + 2) in
+          if has_popup st && (d == 65 || d == 66) then
+            _apply (popup_move st (if d == 65 then (0 - 1) else 1)) (i + 3) n
+          else
+          // An unshifted arrow DROPS the selection, the way it does everywhere
+          // else: moving without shift means you are done with it.
+          let plain = sel_clear st in
+          let st2 = if d == 65 then move_vert plain (0 - 1)
+                    else if d == 66 then move_vert plain 1
+                    else if d == 67 then move_to plain (next_char plain plain.cur)
+                    else if d == 68 then move_to plain (prev_char plain plain.cur)
+                    else st in
+          _apply st2 (i + 3) n
+        else _apply st (i + 2) n
+      else st
+    else if c < 32 then _apply st (i + 1) n
+    else
+      let e = _run_end n i in
+      // Typing with a selection replaces it, like every other editor.
+      let st1 = if has_sel st then do_delete_sel_or_back st else sel_clear st in
+      _apply (do_insert st1 (_gather i e)) e n;
+
+// --- the loop -------------------------------------------------------------
+
+// An answer that MOVES or CHANGES the buffer is acted on the moment it lands;
+// one that only shows something (hover, completion) is left for the renderer
+// to draw. Acting here rather than in src/lsp.mere is the split that file is
+// built around: it knows the protocol, and only the editor has the buffer.
+let _act_on = fn (st: ed) ->
+  match st.lsp.answer with
+  | ADef (uri, line, ch) -> jump_to (dismiss_popup st) uri line ch
+  | AEdits (es) -> apply_edits (dismiss_popup st) es
+  | ATokens (ns) -> take_tokens st ns
+  | _ -> (if str_eq st.lsp.note "" then st else ({ st | msg = st.lsp.note } : ed));
+
+// With more than one buffer open there is more than one server, and they share
+// one poll set. What comes off a descriptor belongs to the buffer that opened
+// it: feeding another buffer's diagnostics into the active client would show
+// its errors against this file, and desynchronise both frame readers.
+let rec _feed_parked = fn (ps: parked list) -> fn (fd: int) -> fn (chunk: str) ->
+                       fn (acc: parked list) ->
+  match ps with
+  | Nil -> list_rev acc
+  | Cons (p, r) ->
+    let p2 = if p.p_lsp.alive && p.p_lsp.fd == fd
+             then ({ p | p_lsp = Lsp.feed p.p_lsp chunk } : parked) else p in
+    _feed_parked r fd chunk (Cons (p2, acc));
+
+let rec _kill_parked = fn (ps: parked list) -> fn (fd: int) -> fn (acc: parked list) ->
+  match ps with
+  | Nil -> list_rev acc
+  | Cons (p, r) ->
+    let p2 = if p.p_lsp.fd == fd
+             then ({ p | p_lsp = ({ p.p_lsp | alive = false } : lsp) } : parked) else p in
+    _kill_parked r fd (Cons (p2, acc));
+
+let read_lsp = fn (st: ed) -> fn (fd: int) ->
+  let n = tcp_read fd lbuf 262144 in
+  if n <= 0 then
+    let _ = io_poll_del poll fd in
+    if fd == st.lsp.fd then ({ st | lsp = ({ st.lsp | alive = false } : lsp) } : ed)
+    else ({ st | others = _kill_parked st.others fd Nil } : ed)
+  else
+    let chunk = mem_to_str lbuf n in
+    // Only the buffer on screen acts on an answer: a jump or a formatting edit
+    // belongs to the document that asked for it, and a parked buffer has no
+    // question outstanding -- parking clears it.
+    if fd == st.lsp.fd then _act_on ({ st | lsp = Lsp.feed st.lsp chunk } : ed)
+    else ({ st | others = _feed_parked st.others fd chunk Nil } : ed);
 
 // One ready event at a time: fd 0 is the keyboard, anything else is the server.
 let rec _serve = fn (st: ed) -> fn (i: int) -> fn (n: int) ->
@@ -361,7 +1640,7 @@ let rec _serve = fn (st: ed) -> fn (i: int) -> fn (n: int) ->
         // Rule 2: the edit happens OUTSIDE the frame's region, because the new
         // piece list has to outlive the frame.
         else _apply ({ st | msg = "" } : ed) 0 got
-      else read_lsp st
+      else read_lsp st fd
     in
     _serve st2 (i + 1) n;
 
@@ -377,6 +1656,14 @@ let rec loop = fn (st: ed) ->
       // which is how a resize is noticed without a SIGWINCH handler racing the
       // redraw.
       let st = push_change st in
+      // Give up on a question the server never answered. This is the only
+      // place a timeout can be noticed: the editor blocks in poll(2), so
+      // nothing else runs while it waits.
+      let st = ({ st | lsp = Lsp.tick st.lsp } : ed) in
+      let st = if str_eq st.lsp.note "" then st else ({ st | msg = st.lsp.note } : ed) in
+      // The highlighting is re-asked for on the same tick the change is sent,
+      // which is the only moment the server and the buffer agree.
+      let st = if st.toks_stale then ask_tokens st else st in
       let r = term_rows () in
       let c = term_cols () in
       if r > 0 && (r != st.rows || c != st.cols) then
@@ -401,49 +1688,193 @@ let rec _first_path = fn (xs: str list) ->
   | Nil -> ""
   | Cons (x, rest) -> if str_starts_with x "--" then _first_path rest else x;
 
+// The paths after the first one, which become the other buffers.
+let rec _rest_paths = fn (xs: str list) -> fn (first: str) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (x, rest) ->
+    if str_starts_with x "--" then _rest_paths rest first
+    else if str_eq x first then rest_paths_of rest
+    else _rest_paths rest first
+and rest_paths_of = fn (xs: str list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (x, rest) ->
+    if str_starts_with x "--" then rest_paths_of rest else Cons (x, rest_paths_of rest);
+
+// --- what this terminal does with Ambiguous width ------------------------
+// The standard declines to decide whether `±` is one column or two, so the only
+// honest answer is to ASK: print one, ask where the cursor ended up with
+// `ESC[6n`, and read the reply. That is a measurement of this terminal rather
+// than a guess from $LANG, which says what language the user reads and nothing
+// about how the emulator draws.
+//
+// THE PROBE MUST NOT EAT WHAT SOMEBODY TYPED. It reads fd 0, and anything
+// already waiting there is a keystroke, not an answer -- the first version of
+// this swallowed one arrow key of a test that pressed two, and the editor
+// silently started one column to the left. So the reply is CUT OUT of what was
+// read and everything else is left in the key buffer for the loop to handle.
+//
+// Bounded, too: if nothing answers within the poll the default stands. A
+// terminal that does not implement `ESC[6n` must not be one the editor hangs
+// on.
+
+// Cut the `ESC [ <row> ; <col> R` reply out of `kbuf[0, n)`. Returns
+// (col, leftover) with the leftover bytes compacted to the front of kbuf.
+let _take_cpr = fn (n: int) ->
+  // Find the reply: ESC, '[', then digits and ';' up to 'R'.
+  let rec find = fn (i: int) ->
+    if i + 1 >= n then (0 - 1)
+    else if mem_get_u8 kbuf i == 27 && mem_get_u8 kbuf (i + 1) == 91 then
+      let rec fin = fn (j: int) ->
+        if j >= n then (0 - 1)
+        else
+          let b = mem_get_u8 kbuf j in
+          if b == 82 then j
+          else if (b >= 48 && b <= 57) || b == 59 then fin (j + 1)
+          else (0 - 1) in
+      let e = fin (i + 2) in
+      if e >= 0 then i else find (i + 1)
+    else find (i + 1) in
+  let start = find 0 in
+  if start < 0 then (0, n)
+  else
+    let rec fin = fn (j: int) -> if mem_get_u8 kbuf j == 82 then j else fin (j + 1) in
+    let stop = fin (start + 2) in
+    // The column is the number after the ';'.
+    let rec col = fn (j: int) -> fn (acc: int) -> fn (seen: bool) ->
+      if j > stop then (if seen then acc else 0)
+      else
+        let b = mem_get_u8 kbuf j in
+        if b == 59 then col (j + 1) 0 true
+        else if seen && b >= 48 && b <= 57 then col (j + 1) (acc * 10 + b - 48) true
+        else col (j + 1) acc seen in
+    let c = col (start + 2) 0 false in
+    // Compact everything outside [start, stop] to the front.
+    let rec compact = fn (i: int) -> fn (w: int) ->
+      if i >= n then w
+      else if i >= start && i <= stop then compact (i + 1) w
+      else
+        let _ = mem_set_u8 kbuf w (mem_get_u8 kbuf i) in
+        compact (i + 1) (w + 1) in
+    (c, compact 0 0);
+
+// Ask once. `held` is how many keystrokes are already sitting at the front of
+// kbuf from an earlier call, which must not be overwritten.
+let probe_once = fn (held: int) ->
+  let _ = print_no_nl (esc ++ "[6n") in
+  let ready = io_poll_wait poll 120 in
+  if ready <= 0 then (0, held)
+  else
+    let got = tcp_read 0 (kbuf + held) (2048 - held) in
+    if got <= 0 then (0, held)
+    else _take_cpr (held + got);
+
+let measure_amb = fn () ->
+  let _ = print_no_nl (esc ++ "[H" ++ esc ++ "[2K") in
+  // One ambiguous-width character, then ask where the cursor is. Column 2
+  // means it drew one cell; column 3 means two.
+  let _ = print_no_nl (esc ++ "[H" ++ chr 194 ++ chr 177) in
+  let r = probe_once 0 in
+  let _ = print_no_nl (esc ++ "[H" ++ esc ++ "[2K") in
+  let c = fst r in
+  ((if c >= 3 then 2 else if c == 2 then 1 else 0), snd r);
+
 let amb_width = if _has_wide argv then 2 else 1;
 
 match _first_path argv with
   | "" -> print "usage: medit2 [--wide] FILE"
   | path ->
-    let _ = if file_exists path then () else write_file path "" in
-    let sz = file_size path in
-    let f = file_openrw path in
-    let o = Disk ((f, sz)) in
     let r0 = term_rows () in
     let c0 = term_cols () in
-    // A language server is attached to SOURCE files only, and small ones.
-    // `mere lsp` syncs full text, so pointing it at the 208 MB file this
-    // editor exists to open would re-send 208 MB on every idle tick. The two
-    // axes do not overlap and the editor should not pretend they do.
-    let want_lsp = str_ends_with path ".mere" && sz < 1048576 in
-    let lfd = if want_lsp then proc_open "mere lsp" else (0 - 1) in
-    let _ = if lfd >= 0 then io_poll_add poll lfd 1 else 0 in
-    let lsp0 = Lsp.connect lfd in
-    let lsp0 = if lfd < 0 then lsp0
-               else
-                 let hi = Lsp.hello path (read_file path) in
-                 let n = mem_copy_str lbuf 0 hi in
-                 let w = tcp_write lfd lbuf n in
-                 if w < 0 then ({ lsp0 | alive = false } : lsp) else lsp0 in
-    let st0 = (ed { buf = Buffer.of_origin o,
-                 starts = Lines.index_of o,
-                 total = sz,
+    // The config, before anything is drawn. `try_or` around the parse as well
+    // as around the read: a half-written TOML file must not be the reason the
+    // editor will not start.
+    let cpath = config_path () in
+    let ctext = if str_eq cpath "" || not (file_exists cpath) then ""
+                else try_or (fn () -> read_file cpath) "" in
+    let cdoc = if str_eq ctext "" then Nil
+               else try_or (fn () -> Toml.parse_toml ctext) Nil in
+    let cbroken = not (str_eq ctext "") && (match cdoc with Nil -> true | _ -> false) in
+    let km = default_keymap () in
+    let knote = _apply_keys cdoc km action_names 0 "" in
+    let ccolors =
+      let rec pick = fn (names: str list) -> fn (acc: (str * str) list) ->
+        match names with
+        | Nil -> acc
+        | Cons (nm, r) ->
+          let key = "color." ++ nm in
+          if not (Toml.has cdoc key) then pick r acc
+          else (match Toml.get cdoc key with
+                | TStr (v) -> pick r (Cons ((nm, v), acc))
+                | TInt (v) -> pick r (Cons ((nm, show v), acc))
+                | _ -> pick r acc) in
+      pick (Cons ("keyword", Cons ("string", Cons ("number", Cons ("comment",
+             Cons ("function", Cons ("parameter", Cons ("variable",
+             Cons ("enumMember", Nil))))))))) Nil in
+    // Measured before the alternate screen is cleared, while the cursor report
+    // can still be read off fd 0 without competing with the editor's own loop.
+    let probe = if _has_wide argv then (0, 0) else measure_amb () in
+    let probed = fst probe in
+    let conf_note =
+      if cbroken then "  [config: unreadable, using defaults]"
+      else if not (str_eq knote "") then "  [config:" ++ knote ++ "]"
+      else "" in
+    // Every file named on the command line becomes a buffer; the first one is
+    // the one on screen. `open_doc` is the same function Ctrl-O calls, so a
+    // file opened later is opened the same way as a file opened at startup.
+    let d0 = open_doc path in
+    let rest = _rest_paths argv path in
+    let st0 = (ed { buf = d0.p_buf,
+                 starts = d0.p_starts,
+                 total = d0.p_total,
                  cur = 0, goal = 0, top = 0,
                  rows = if r0 > 0 then r0 else 24,
                  cols = if c0 > 0 then c0 else 80,
-                 path = path,
-                 msg = "Ctrl-S save  Ctrl-Q quit  Ctrl-Z undo",
-                 dirty = false, quit = false, amb = amb_width,
-                 lsp = lsp0, dirty_for_lsp = false } : ed) in
+                 path = d0.p_path,
+                 msg = "Ctrl-S save  Ctrl-Q quit  Ctrl-Z undo" ++ conf_note,
+                 dirty = false, quit = false,
+                 // Three answers in order of how specific they are: the flag
+                 // was typed for this run, the config was written for this
+                 // terminal, and the probe measured it. The probe answers 0
+                 // when nothing replied, and then the default stands.
+                 amb = if _has_wide argv then 2
+                       else if _conf_bool cdoc "wide" false then 2
+                       else if probed > 0 then probed
+                       else 1,
+                 anchor = None, clip = "",
+                 prompt = None, last_needle = "",
+                 lsp = d0.p_lsp, jumps = Nil, cmp_sel = 0,
+                 toks = d0.p_toks, ntok = d0.p_ntok,
+                 toks_stale = d0.p_toks_stale,
+                 keymap = km,
+                 tabstop = _conf_int cdoc "tabstop" 2,
+                 numbers = _conf_bool cdoc "line_numbers" false,
+                 colors = ccolors, conf_note = conf_note,
+                 others = list_map rest open_doc,
+                 dirty_for_lsp = false } : ed) in
     let _ = tty_raw () in
     let _ = tty_no_signal_keys () in
     let _ = term_editor_output () in
     let _ = print_no_nl (esc ++ "[2J") in
+    // Whatever the probe read that was not its answer is a keystroke somebody
+    // typed while the editor was starting. It is applied before the loop, so
+    // it is not lost and not delivered out of order.
+    let st0 = if snd probe > 0 then _apply st0 0 (snd probe) else st0 in
     let fin = loop st0 in
     let _ = tty_restore () in
     let _ = print_no_nl (esc ++ "[2J" ++ esc ++ "[H") in
+    // Every buffer's server, not just the one that was on screen. The file
+    // descriptors would be closed by exit anyway; the CHILD PROCESSES would
+    // not, and a `mere lsp` whose pipe never closes is a process left behind.
     let _ = if fin.lsp.alive then tcp_close fin.lsp.fd else () in
-    let _ = file_close f in
-    print ("medit2: " ++ path ++ " " ++ show fin.total ++ " bytes"
-           ++ (if fin.dirty then " (unsaved)" else ""))
+    let rec _close_rest = fn (ps: parked list) ->
+      match ps with
+      | Nil -> ()
+      | Cons (p, r) ->
+        let _ = if p.p_lsp.alive then tcp_close p.p_lsp.fd else () in
+        _close_rest r in
+    let _ = _close_rest fin.others in
+    print ("medit2: " ++ fin.path ++ " " ++ show fin.total ++ " bytes"
+           ++ (if fin.dirty then " (unsaved)" else "")
+           ++ (let n = nbuffers fin in if n > 1 then "  (" ++ show n ++ " buffers)" else ""))

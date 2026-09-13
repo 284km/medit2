@@ -89,6 +89,32 @@ let _ = both "undo past the bottom is a no-op" (fn (b: buf) -> Buffer.undo (Buff
 let _ = both "undo one of two"
           (fn (b: buf) -> Buffer.undo (Buffer.insert (Buffer.insert b 0 "a") 0 "b"))
           "athe quick brown fox";
+// --- the caller's mark ------------------------------------------------------
+// The editor puts the cursor in it, so that undo restores the text AND the
+// place your next keystroke lands. Nothing in the buffer reads the number.
+let marked = Buffer.mark (Buffer.insert mem 0 "x") 7;
+let _ = check_int "a mark is read back" (Buffer.mark_of marked) 7;
+let _ = check_int "an unmarked snapshot answers -1"
+          (Buffer.mark_of (Buffer.insert mem 0 "x")) (0 - 1);
+let _ = check_int "a fresh buf has no mark" (Buffer.mark_of mem) (0 - 1);
+// A second edit pushes a new snapshot, so the mark read is the NEW one's --
+// not the one underneath it.
+let _ = check_int "the mark read is the top of the stack"
+          (Buffer.mark_of (Buffer.mark (Buffer.insert marked 0 "y") 3)) 3;
+// Undoing moves the state to the redo stack, and the redo mark is its own.
+let undone = Buffer.mark_redo (Buffer.undo marked) 4;
+let _ = check_int "the redo mark is separate" (Buffer.mark_redo_of undone) 4;
+let _ = check_int "and undoing past the bottom leaves no mark"
+          (Buffer.mark_of (Buffer.undo (Buffer.undo marked))) (0 - 1);
+// Redo restores the text as well as accepting a mark.
+let _ = check "redo puts the text back" (Buffer.text (Buffer.redo undone))
+          (Buffer.text (Buffer.insert mem 0 "x"));
+let _ = check_int "an edit clears the redo stack"
+          (if Buffer.can_redo (Buffer.insert (Buffer.undo marked) 0 "z") then 1 else 0) 0;
+let _ = check_int "can_redo after an undo"
+          (if Buffer.can_redo (Buffer.undo marked) then 1 else 0) 1;
+let _ = check_int "can_redo on a fresh buf" (if Buffer.can_redo mem then 1 else 0) 0;
+
 let _ = check_int "can_undo on a fresh buf" (if Buffer.can_undo mem then 1 else 0) 0;
 let _ = check_int "can_undo after an edit" (if Buffer.can_undo (Buffer.insert mem 0 "x") then 1 else 0) 1;
 

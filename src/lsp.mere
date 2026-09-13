@@ -19,6 +19,40 @@
 
 import "mere-json/json.mere";
 
+// The monotonic clock, used only to give up on an unanswered request. Declared
+// here rather than in the editor because the timeout belongs to the protocol:
+// nothing else in medit2 cares what time it is.
+extern fn now_ms: unit -> int;
+
+// What a reply is FOR. The protocol correlates a response to a request by id
+// and says nothing about what the client wanted it for, so the client has to
+// remember -- and remembering "an id is outstanding" is not enough, because
+// the answer to `hover` and the answer to `definition` are both a JSON object
+// and are handled completely differently.
+type want = WInit | WHover | WDefinition | WComplete | WFormat | WTokens | WNone;
+
+// One entry of a `textDocument/formatting` reply. Positions are the protocol's
+// zero-based (line, character); turning them into buffer offsets is the
+// editor's job, since only it has the line index.
+type tedit = { sl: int, sc: int, el: int, ec: int, text: str };
+
+// The answer, already parsed into the shape the editor draws. A variant rather
+// than a bag of optional fields: `hover` and `definition` both come back as a
+// JSON object, and holding "a string AND a position AND a list" would let the
+// editor read a field the current reply never filled in.
+type answer =
+  | ANone
+  | AHover of str
+  | ADef of (str * int * int)     // uri, line, character -- all zero-based
+  | ACompl of str list
+  | AEdits of tedit list
+  // Semantic tokens, DELTA-DECODED into absolute numbers, four per token:
+  // line, character, length, kind. A flat list rather than a list of records
+  // because that is the shape the protocol sends and the shape the renderer
+  // indexes; giving each quadruple a name would cost an allocation per token
+  // on a file that has thousands.
+  | ATokens of int list;
+
 type lsp = {
   fd: int,
   pending: str,     // bytes read but not yet a complete frame
@@ -26,6 +60,28 @@ type lsp = {
   diag: str,        // the first diagnostic, as a line for the status bar
   ndiag: int,
   alive: bool,
+  // The id of the request in flight and what it was for. ONE at a time: an
+  // editor asks in response to a keystroke, and a second question before the
+  // first is answered means the first answer is already stale. A table of
+  // outstanding requests would be the general thing and would buy nothing
+  // here -- and every entry in it would be an answer nobody is still waiting
+  // for.
+  req_id: int,
+  req_want: want,
+  // When it went out, so an unanswered request can be given up on. A server
+  // that never replies must not leave the editor waiting for a keystroke it
+  // will never get an answer to -- and `mere lsp` type-checks the file to
+  // answer a hover, so "slow" is a normal state, not a broken one.
+  req_at: int,
+  // What came back, for the editor to draw. Cleared when a new request goes out
+  // so a stale answer cannot be shown beside a new question.
+  answer: answer,
+  note: str,        // "" or a one-line status, e.g. a timeout
+  // The semantic-token type names, in the order the server numbered them.
+  // It comes from the initialize reply: a token's "kind" is an INDEX into this
+  // list and means nothing without it, so hard-coding the order would be
+  // hard-coding one server's build.
+  legend: str list,
 };
 
 module Lsp {
@@ -71,7 +127,8 @@ module Lsp {
   // --- the connection ------------------------------------------------------
   let connect = fn (fd: int) ->
     (lsp { fd = fd, pending = "", version = 1, diag = "", ndiag = 0,
-           alive = fd >= 0 } : lsp);
+           alive = fd >= 0, req_id = 0, req_want = WNone, req_at = 0,
+           answer = ANone, note = "", legend = Nil } : lsp);
 
   let uri_of = fn (path: str) ->
     // The server resolves imports against this, so it has to be absolute.
@@ -80,7 +137,10 @@ module Lsp {
   // The three messages that have to arrive before a server will say anything:
   // initialize, initialized, didOpen. Sent as one write, because they are one
   // handshake and a server that gets them in pieces is a server waiting.
-  let hello = fn (path: str) -> fn (text: str) ->
+  // Returns the bytes AND the client state, because the initialize reply is a
+  // response like any other: it carries id 1, and the client has to be
+  // expecting it or the legend it brings is dropped as an uncorrelated answer.
+  let hello = fn (st: lsp) -> fn (path: str) -> fn (text: str) ->
     let uri = uri_of path in
     let init = "\{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":"
             ++ "\{\"processId\":null,\"rootUri\":null,\"capabilities\":\{}}}" in
@@ -88,13 +148,40 @@ module Lsp {
     let opened = "\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":"
               ++ "\{\"textDocument\":\{\"uri\":\"" ++ uri ++ "\",\"languageId\":\"mere\","
               ++ "\"version\":1,\"text\":\"" ++ escape text ++ "\"}}}" in
-    frame init ++ frame inited ++ frame opened;
+    (frame init ++ frame inited ++ frame opened,
+     ({ st | req_id = 1, req_want = WInit, req_at = now_ms () } : lsp));
 
   let change = fn (path: str) -> fn (v: int) -> fn (text: str) ->
     let uri = uri_of path in
     frame ("\{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":"
         ++ "\{\"textDocument\":\{\"uri\":\"" ++ uri ++ "\",\"version\":" ++ show v ++ "},"
         ++ "\"contentChanges\":[\{\"text\":\"" ++ escape text ++ "\"}]}}");
+
+  // --- requests --------------------------------------------------------------
+  // A position in the protocol is (line, character) ZERO-BASED, and `character`
+  // counts UTF-16 code units. Converting the editor's byte offsets into those
+  // units is the CALLER's job -- it is the one holding the text -- and this
+  // file only spells the number into JSON.
+  let _pos = fn (line: int) -> fn (ch: int) ->
+    "\{\"line\":" ++ show line ++ ",\"character\":" ++ show ch ++ "}";
+
+  let request = fn (st: lsp) -> fn (path: str) -> fn (method: str) ->
+                fn (params_extra: str) -> fn (w: want) ->
+    let id = st.req_id + 1 in
+    let body = "\{\"jsonrpc\":\"2.0\",\"id\":" ++ show id
+            ++ ",\"method\":\"" ++ method ++ "\",\"params\":\{"
+            ++ "\"textDocument\":\{\"uri\":\"" ++ uri_of path ++ "\"}"
+            ++ params_extra ++ "}}" in
+    // The reply is cleared here and not when it arrives: a new question must
+    // not leave the previous answer on screen beside it.
+    (frame body, ({ st | req_id = id, req_want = w, req_at = now_ms (),
+                         answer = ANone, note = "" } : lsp));
+
+  let at_position = fn (line: int) -> fn (ch: int) ->
+    ",\"position\":" ++ _pos line ch;
+
+  let format_options =
+    ",\"options\":\{\"tabSize\":2,\"insertSpaces\":true}";
 
   // --- reading -------------------------------------------------------------
   // One frame out of the pending buffer, if a whole one is there. Returns
@@ -158,6 +245,159 @@ module Lsp {
          | Nil -> ({ st | diag = "", ndiag = 0 } : lsp))
     | _ -> st;
 
+  // --- responses -----------------------------------------------------------
+  // Each of these reads ONE shape, because the client asked one question. The
+  // protocol makes almost every result a union (`Hover | null`,
+  // `Location | Location[] | LocationLink[]`, `CompletionItem[] | CompletionList`)
+  // so each parser takes both spellings and answers `ANone` for a null.
+
+  let _first = fn (xs: json list) ->
+    match xs with | Nil -> JNull | Cons (x, _) -> x;
+
+  // Hover.contents: MarkupContent \{kind, value}, MarkedString (a bare string or
+  // \{language, value}), or an array of MarkedString.
+  let rec _hover_text = fn (v: json) ->
+    match v with
+    | JStr (s) -> s
+    | JArr (xs) -> _hover_text (_first xs)
+    | JObj (_) -> _str (_field v "value")
+    | _ -> "";
+
+  let _parse_hover = fn (result: json) ->
+    let t = str_trim (_hover_text (_field result "contents")) in
+    if str_eq t "" then ANone else AHover (t);
+
+  let _loc_of = fn (v: json) ->
+    // A LocationLink spells the target `targetUri`/`targetRange`; a Location
+    // spells it `uri`/`range`. Taking whichever is present is shorter than
+    // deciding which kind the server sent.
+    let uri = let u = _str (_field v "uri") in
+              if str_eq u "" then _str (_field v "targetUri") else u in
+    let rng = let r = _field v "range" in
+              (match r with | JNull -> _field v "targetSelectionRange" | _ -> r) in
+    let rng2 = (match rng with | JNull -> _field v "targetRange" | _ -> rng) in
+    let st_ = _field rng2 "start" in
+    if str_eq uri "" then ANone
+    else ADef ((uri, _num (_field st_ "line"), _num (_field st_ "character")));
+
+  let _parse_def = fn (result: json) ->
+    match result with
+    | JArr (xs) -> (match _first xs with | JNull -> ANone | v -> _loc_of v)
+    | JObj (_) -> _loc_of result
+    | _ -> ANone;
+
+  let rec _labels = fn (xs: json list) -> fn (acc: str list) ->
+    match xs with
+    | Nil -> list_rev acc
+    | Cons (x, rest) ->
+      let l = _str (_field x "label") in
+      _labels rest (if str_eq l "" then acc else Cons (l, acc));
+
+  let _parse_compl = fn (result: json) ->
+    let xs = (match result with
+              | JArr (a) -> a
+              | JObj (_) -> (match _field result "items" with
+                             | JArr (a) -> a
+                             | _ -> Nil)
+              | _ -> Nil) in
+    let ls = _labels xs Nil in
+    (match ls with | Nil -> ANone | _ -> ACompl (ls));
+
+  let rec _edits = fn (xs: json list) -> fn (acc: tedit list) ->
+    match xs with
+    | Nil -> list_rev acc
+    | Cons (x, rest) ->
+      let r = _field x "range" in
+      let a = _field r "start" in
+      let z = _field r "end" in
+      _edits rest (Cons ((tedit { sl = _num (_field a "line"), sc = _num (_field a "character"),
+                                  el = _num (_field z "line"), ec = _num (_field z "character"),
+                                  text = _str (_field x "newText") } : tedit), acc));
+
+  // The legend, out of the initialize reply. A server that does not offer
+  // semantic tokens leaves this empty and the editor simply never asks.
+  let rec _strs = fn (xs: json list) -> fn (acc: str list) ->
+    match xs with
+    | Nil -> list_rev acc
+    | Cons (x, r) -> _strs r (Cons (_str x, acc));
+
+  let _parse_legend = fn (result: json) ->
+    let prov = _field (_field result "capabilities") "semanticTokensProvider" in
+    match _field (_field prov "legend") "tokenTypes" with
+    | JArr (xs) -> _strs xs Nil
+    | _ -> Nil;
+
+  // The token stream is five integers per token and every one of them is a
+  // DELTA: the line from the previous token's line, and the character from the
+  // previous token's character WHEN THEY SHARE A LINE. Decoding it wrong paints
+  // the file at an offset that grows, which looks like the highlighting
+  // drifting rather than like a decoding bug.
+  let rec _decode = fn (xs: json list) -> fn (line: int) -> fn (ch: int) ->
+                    fn (acc: int list) ->
+    match xs with
+    | Cons (a, Cons (b, Cons (c, Cons (d, Cons (_, rest))))) ->
+      let dl = _num a in
+      let l2 = line + dl in
+      let c2 = if dl == 0 then ch + _num b else _num b in
+      _decode rest l2 c2 (Cons (_num d, Cons (_num c, Cons (c2, Cons (l2, acc)))))
+    // Anything that is not a multiple of five is a stream this client cannot
+    // read; stopping keeps what was decoded rather than guessing at the rest.
+    | _ -> list_rev acc;
+
+  let _parse_tokens = fn (result: json) ->
+    match _field result "data" with
+    | JArr (xs) -> (match _decode xs 0 0 Nil with | Nil -> ANone | ns -> ATokens (ns))
+    | _ -> ANone;
+
+  let _parse_edits = fn (result: json) ->
+    match result with
+    | JArr (xs) -> (match _edits xs Nil with | Nil -> ANone | es -> AEdits (es))
+    | _ -> ANone;
+
+  // A message with an `id` and no `method` is a response. It is only OUR
+  // response if the id is the one in flight: a late reply to a question the
+  // user has already moved on from carries the previous id, and applying it
+  // would answer about the wrong position.
+  let _response = fn (st: lsp) -> fn (v: json) ->
+    let id = _num (_field v "id") in
+    if id != st.req_id then st
+    else
+      let result = _field v "result" in
+      (match _field v "error" with
+       | JObj (_) ->
+         ({ st | req_want = WNone, answer = ANone,
+                 note = "lsp error: " ++ _str (_field (_field v "error") "message") } : lsp)
+       | _ ->
+         // The initialize reply is not an ANSWER -- nothing asked a question
+         // the user is waiting for -- so it updates the legend and leaves the
+         // answer empty rather than reporting "no answer" for a handshake.
+         (match st.req_want with
+          | WInit ->
+            ({ st | req_want = WNone, answer = ANone, note = "",
+                    legend = _parse_legend result } : lsp)
+          | _ ->
+            let a = (match st.req_want with
+                     | WHover -> _parse_hover result
+                     | WDefinition -> _parse_def result
+                     | WComplete -> _parse_compl result
+                     | WFormat -> _parse_edits result
+                     | WTokens -> _parse_tokens result
+                     | WInit -> ANone
+                     | WNone -> ANone) in
+            ({ st | req_want = WNone, answer = a,
+                    note = (match a with | ANone -> "no answer" | _ -> "") } : lsp)));
+
+  // Give up on a request the server never answered. Called from the editor's
+  // poll loop, which already wakes on a timeout, so no extra timer is needed.
+  let timeout_ms = 3000;
+
+  let tick = fn (st: lsp) ->
+    (match st.req_want with
+     | WNone -> st
+     | _ ->
+       if now_ms () - st.req_at < timeout_ms then st
+       else ({ st | req_want = WNone, answer = ANone, note = "lsp: no answer" } : lsp));
+
   let handle = fn (st: lsp) -> fn (body: str) ->
     // try_or, because a server is allowed to send something this client has no
     // parser for, and an editor that dies on an unexpected notification is
@@ -167,6 +407,9 @@ module Lsp {
       let m = _str (_field v "method") in
       if str_eq m "textDocument/publishDiagnostics"
       then apply_diagnostics st (_field v "params")
+      // No method means it is a response -- and a REQUEST from the server (it
+      // would have both) is not something this client answers.
+      else if str_eq m "" then _response st v
       else st) st;
 
   let rec _drain = fn (st: lsp) ->
