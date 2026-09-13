@@ -35,6 +35,15 @@ clang -O2 /tmp/medit2_buffer_test.c -o /tmp/medit2_buffer_test 2>/dev/null
 /tmp/medit2_buffer_test | tail -3
 /tmp/medit2_buffer_test | grep -q "buffer: all ok" || fails=$((fails + 1))
 
+# --- 1a2. the line index ---------------------------------------------------
+# The index is LAZY: it covers a prefix of the document and grows on demand.
+# The interesting cases are the seam between two pages, and what a truncation
+# at an edit leaves behind -- neither of which the pty suite can see, because
+# every file it uses fits in the first page.
+step "line index"
+"$MERE" test/lines_test.mere | tail -2
+"$MERE" test/lines_test.mere | grep -q "lines: all ok" || fails=$((fails + 1))
+
 # --- 1b. search ------------------------------------------------------------
 # Headless, because the interesting cases are about offsets and window
 # boundaries rather than about the screen: a match that straddles a 256 KiB
@@ -87,29 +96,57 @@ fi
 cat > /tmp/medit2_open_check.mere <<'MERE'
 import "src/buffer.mere";
 import "src/lines.mere";
+extern fn now_ms: unit -> int;
 let path = "/tmp/medit2_verify_big.txt";
 let sz = file_size path;
 let f = file_openrw path;
 let o = Disk ((f, sz));
 let b = Buffer.of_origin o;
-let idx = Lines.index_of o;
-let _ = print ("bytes " ++ show sz ++ " lines " ++ show (Lines.count idx)
-               ++ " pieces " ++ show (Buffer.piece_count b)) in
+
+// What OPENING costs. The index is lazy: enough of it to draw a screen, and
+// no more. This is the number the editor's startup is made of.
+let t0 = now_ms ();
+let ix = Lines.extend_to_line b (Lines.fresh ()) sz 24;
+let t1 = now_ms ();
+let _ = print ("open_ms " ++ show (t1 - t0)
+               ++ " open_lines " ++ show (Lines.count ix)
+               ++ " pieces " ++ show (Buffer.piece_count b));
+
+// And what the WHOLE index costs, which is what a line count or a jump to the
+// end pays for. The file still must not be in memory.
+let full = Lines.extend_all b ix sz;
+let _ = print ("bytes " ++ show sz ++ " lines " ++ show (Lines.count full));
 file_close f
 MERE
 cp /tmp/medit2_open_check.mere ./.verify_open_check.mere
 "$MERE" -c ./.verify_open_check.mere > /tmp/medit2_open_check.c
 rm -f ./.verify_open_check.mere
 clang -O2 /tmp/medit2_open_check.c -o /tmp/medit2_open_check 2>/dev/null
-RSS=$(/usr/bin/time -l /tmp/medit2_open_check 2>&1 | awk '/maximum resident/{print $1}')
-/usr/bin/time -l /tmp/medit2_open_check 2>&1 | grep -E "^bytes"
+/usr/bin/time -l /tmp/medit2_open_check > /tmp/medit2_open_out.txt 2>/tmp/medit2_open_time.txt
+cat /tmp/medit2_open_out.txt
+RSS=$(awk '/maximum resident/{print $1}' /tmp/medit2_open_time.txt)
 KB=$((RSS / 1024))
 echo "peak RSS ${KB} KiB"
-# The line index is 8 bytes per line and is the bulk of it; the document itself
-# must not be in there. 60 MB is generous room over the ~21 MB index and still
-# an order of magnitude under the 208 MB file.
+
+# Opening reads ONE PAGE, not the file. Anything more than a handful of lines
+# means the index is being built eagerly again, which is what cost 822 ms
+# before the first frame on a 1 GB file.
+OPEN_LINES=$(awk '{for(i=1;i<=NF;i++) if($i=="open_lines") print $(i+1)}' /tmp/medit2_open_out.txt)
+if [ "${OPEN_LINES:-0}" -gt 5000 ]; then
+  echo "verify: opening indexed $OPEN_LINES lines -- the index is not lazy" >&2
+  fails=$((fails + 1))
+fi
+OPEN_MS=$(awk '{for(i=1;i<=NF;i++) if($i=="open_ms") print $(i+1)}' /tmp/medit2_open_out.txt)
+if [ "${OPEN_MS:-999}" -gt 50 ]; then
+  echo "verify: opening took ${OPEN_MS} ms -- it should be one page" >&2
+  fails=$((fails + 1))
+fi
+
+# And the whole index is still 8 bytes per LINE over a file never loaded.
+# 60 MB is generous room over the ~21 MB index and an order of magnitude under
+# the 208 MB file.
 if [ "$KB" -gt 61440 ]; then
-  echo "verify: opening 208 MB took ${KB} KiB -- the file is being loaded" >&2
+  echo "verify: 208 MB took ${KB} KiB -- the file is being loaded" >&2
   fails=$((fails + 1))
 fi
 

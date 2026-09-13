@@ -63,6 +63,56 @@ let w3 = Search.find_prev b n 1 "the" in
 let _ = check "find_prev wraps to the end" (fst w3) 31;
 let _ = check_b "find_prev says it wrapped" (snd w3) true;
 
+// --- the wrap reads what the first pass did NOT ----------------------------
+// A failed search used to read the file twice: once from the cursor to the
+// end, and once from the beginning to the end again. Measured on 1 GB that was
+// 278 ms against the 141 ms one pass needs.
+//
+// Bounding the wrap is only correct if it still covers every start the first
+// pass skipped -- INCLUDING a match that begins before the cursor and reaches
+// past it, which the forward pass never looks at because it only considers
+// starts at or after the cursor.
+
+// `forward_upto` is the primitive. Its `stop` is the last START it will accept.
+let _ = check "forward_upto accepts a match starting at its stop"
+          (Search.forward_upto b n 0 4 "quick") 4;
+let _ = check "forward_upto refuses one starting past its stop"
+          (Search.forward_upto b n 0 3 "quick") (0 - 1);
+// The window reads past `stop` so a straddling match can be completed; a hit
+// found there starts too late and must not be reported.
+let _ = check "forward_upto does not report a hit that starts past the stop"
+          (Search.forward_upto b n 0 0 "the") 0;
+let _ = check "forward_upto with an empty span finds nothing"
+          (Search.forward_upto b n 5 4 "the") (0 - 1);
+
+// And the wrap through find_next. "the" is at 0 and 31.
+let w4 = Search.find_next b n 32 "the" in
+let _ = check "the wrap finds the match before the cursor" (fst w4) 0;
+let _ = check_b "and says it wrapped" (snd w4) true;
+
+// A match that STRADDLES the cursor: starting the wrap at the cursor rather
+// than before it would miss this one. "quick" is at 4..8; searching from 6
+// must wrap and still find it.
+let w5 = Search.find_next b n 6 "quick" in
+let _ = check "the wrap finds a match straddling the cursor" (fst w5) 4;
+let _ = check_b "and says it wrapped" (snd w5) true;
+
+// From 0 there is nothing before the cursor, so a miss stays a miss rather
+// than searching an empty span and reporting something.
+let w6 = Search.find_next b n 0 "zebra" in
+let _ = check "a genuine miss is still a miss" (fst w6) (0 - 1);
+let _ = check_b "and did not claim to wrap" (snd w6) false;
+
+// The backward wrap, the other way round: find_prev from 1 finds nothing
+// before it and wraps to the LAST match.
+let w7 = Search.find_prev b n 1 "the" in
+let _ = check "the backward wrap finds the last match" (fst w7) 31;
+let _ = check_b "and says it wrapped" (snd w7) true;
+// From the end there is nothing above to wrap into.
+let w8 = Search.find_prev b n n "zebra" in
+let _ = check "a backward miss is still a miss" (fst w8) (0 - 1);
+let _ = check_b "and did not claim to wrap" (snd w8) false;
+
 // --- a window boundary, at the real window size ----------------------------
 // The needle is placed so that it straddles the 256 KiB boundary: half of it
 // is in the first window and half in the second. Without the overlap this is
@@ -93,6 +143,47 @@ let _ = check "and backward finds the same one"
 // Starting inside the straddle must not find it again.
 let _ = check "forward past the straddle finds nothing"
           (Search.forward bb bsz (page - half + 1) needle) (0 - 1);
+// --- the wrap does not re-read the file ------------------------------------
+// A bound on the wrap changes no ANSWER, only how much is read, so offsets
+// cannot see it: with the bound removed every check above still passes. The
+// window count is what separates them, which is why `find_next_counted`
+// exists rather than a note saying the wrap is bounded.
+//
+// The boundary file is two windows wide. A miss from halfway through the first
+// window must read each window ONCE: the forward pass reads both, and the wrap
+// then covers only the starts below the cursor, which are in the window the
+// pass began in.
+let mid = page / 2;
+let c1 = Search.find_next_counted bb bsz mid "ZZ-nowhere-ZZ" in
+let _ = check "a failed search reads each window once"
+          (snd c1) 3;
+let _ = check "and reports the miss" (fst (fst c1)) (0 - 1);
+
+// From 0 there is nothing to wrap into, so the count is the forward pass alone.
+let c2 = Search.find_next_counted bb bsz 0 "ZZ-nowhere-ZZ" in
+let _ = check "from the start there is no wrap to pay for" (snd c2) 2;
+
+// A hit stops where it is found rather than reading on.
+// The floor is enforced INSIDE a window, not only between windows. Reached
+// through `find_prev` this is invisible -- the wrap's floor is always a point
+// a failed pass has already cleared, so a match below it cannot exist -- which
+// is why `backward_from` is public and tested directly.
+let _ = check "backward_from refuses a match below its floor"
+          (Search.backward_from bb bsz (page - half + 1) bsz needle) (0 - 1);
+let _ = check "and takes one at the floor exactly"
+          (Search.backward_from bb bsz (page - half) bsz needle) (page - half);
+
+// The same for backward: a failed find_prev reads each window once, not twice.
+let c4 = Search.find_prev_counted bb bsz mid "ZZ-nowhere-ZZ" in
+let _ = check "a failed backward search reads each window once" (snd c4) 3;
+let _ = check "and reports the miss" (fst (fst c4)) (0 - 1);
+let c5 = Search.find_prev_counted bb bsz bsz "ZZ-nowhere-ZZ" in
+let _ = check "from the end there is no backward wrap to pay for" (snd c5) 2;
+
+let c3 = Search.find_next_counted bb bsz 0 needle in
+let _ = check "a hit stops at the window it is in" (snd c3) 1;
+let _ = check "and is the straddling match" (fst (fst c3)) (page - half);
+
 let _ = file_close bf;
 
 // --- a needle longer than a window -----------------------------------------

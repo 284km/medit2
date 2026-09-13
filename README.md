@@ -100,9 +100,18 @@ Without a config, `--wide` decides; without that, the editor **asks the
 terminal**: it prints one ambiguous-width character and reads the cursor
 position back with `ESC[6n`. That is a measurement of this terminal rather than
 a guess from `$LANG`, which says what language you read and nothing about how
-the emulator draws. The probe reads the keyboard's descriptor, so it cuts its
-own answer out of what it read and hands the rest back to the editor -- the
-first version swallowed a keystroke typed during startup.
+the emulator draws.
+
+Two things had to be right for that to work at all, and one of them was not:
+
+- the probe reads the keyboard's descriptor, so it cuts its own answer out of
+  what it read and hands the rest back to the editor — the first version
+  swallowed a keystroke typed during startup
+- it has to ask **after** `tty_raw`. In canonical mode the line discipline
+  holds input until a newline, and a cursor-position report does not contain
+  one, so the reply never arrived: the poll timed out, the fallback won, and
+  the auto-detection shipped having never detected anything. The only test that
+  can see that is one that *answers* the probe, which the pty suite now does
 
 ## How it does not load the file
 
@@ -123,35 +132,49 @@ at 1.8 MB now. See [PAIN.md](./PAIN.md) P1.
 
 ### What it costs, measured
 
-`sh bench/big.sh` builds the files and takes these; they are not extrapolated
-from the 208 MB row.
+Two benchmarks, because they answer different questions. `sh bench/big.sh`
+times the pieces; `python3 bench/latency.py ./medit2 FILE` drives the real
+binary over a real pty and times the gap between a keystroke and the screen
+changing, which is the only number a person experiences.
 
-| | 208 MB, 80 B/line | 1 GB, 80 B/line | 1 GB, 8 B/line |
+| keystroke to screen | 208 MB | 1 GB | 1 GB, 8-byte lines |
 |---|---|---|---|
-| lines | 2.6 M | 12.8 M | 128 M |
-| open (build the line index) | 136 ms | 676 ms | 858 ms |
-| **peak RSS** | **24.7 MB** | **104 MB** | **1.00 GB** |
-| line index | 20.8 MB | 102 MB | 1.02 GB |
-| search the whole file, no match | 28 ms | 142 ms | 140 ms |
-| one edit at the top (shift the index) | 1 ms | 7 ms | 116 ms |
-| rebuilding the index instead | 136 ms | 661 ms | 948 ms |
+| **startup** | **9.3 ms** | **8.6 ms** | **8.6 ms** |
+| type a character | 3.7 ms | 3.7 ms | 3.4 ms |
+| press Enter | 3.2 ms | 3.2 ms | 3.2 ms |
+| undo | 3.2 ms | 3.2 ms | 3.2 ms |
+| a line, or a screen, of movement | 3.5 ms | 3.5 ms | 3.1 ms |
+| search, hit at the cursor | 3.5 ms | 3.5 ms | 3.2 ms |
+| search, whole file, no match | 34.6 ms | 147.7 ms | 149.2 ms |
 
-Three things worth reading off it:
+3.1 ms is the harness's own floor, so everything at that number is "faster
+than this can measure". **Startup does not depend on the size of the file**,
+and neither does any edit.
 
-- **The resident memory IS the line index** — 1.00× it, and the document is not
-  in memory at any size. The index is 8 bytes per LINE, so what decides its
-  size is the line length and not the file: 1 GB of ordinary source or log
-  costs 104 MB, and the index only reaches the size of the file it describes at
-  8 bytes per line. Nothing here needs compressing.
-- **Search runs at ~7.2 GB/s**, which is memory bandwidth rather than a loop.
-  It was 548 MB/s until this benchmark was pointed at it: `str_index_of` in the
-  compiler compared the needle at every offset instead of letting `memchr` find
-  the candidate first bytes. Fixed in mere v0.1.479 — 13× for every program in
-  the language, found by measuring an editor.
-- **Shifting the index beats rebuilding it by 94×** at 12.8 M lines (7 ms
-  against 661 ms), which is the trade the incremental index exists for. At
-  128 M lines the shift is 116 ms and would be felt per keystroke; that, and
-  not the memory, is where this design would need rethinking.
+It did, until these were measured. The four that moved:
+
+| | before | after | why |
+|---|---|---|---|
+| open 1 GB | 822 ms | **8.6 ms** | the index is built lazily, a page at a time |
+| press Enter, 1 GB | 730 ms | **3.2 ms** | a newline rebuilt the whole index |
+| undo, 1 GB | 730 ms | **3.2 ms** | so did an undo |
+| type at the top, 128 M lines | 57 ms | **3.4 ms** | every later line start was shifted |
+| search with no match, 1 GB | 278 ms | **148 ms** | the wrap re-read the whole file |
+
+The index still costs **8 bytes per line** and the document is still never in
+memory: 208 MB indexed in full is 25.6 MB resident, 1 GB of 80-byte lines is
+104 MB. What changed is *when* that is paid. The whole index is built only by
+the three things that need the end of the file — an exact line count, a jump
+past what is known, and a jump to the last line — and in idle time, 8 MiB per
+tick, so the count becomes exact a few seconds after opening. Until it does,
+the status bar says `L3/108135+`: the `+` is the difference between a number
+and a claim.
+
+Searching runs at **7.2 GB/s**, which is memory bandwidth rather than a loop.
+It was 548 MB/s until `bench/big.sh` was pointed at it: `str_index_of` in the
+compiler compared the needle at every offset instead of letting `memchr` find
+the candidate first bytes. Fixed in mere v0.1.479 — 13× for every program in
+the language, found by measuring an editor.
 
 ## Two structural rules
 
@@ -254,9 +277,11 @@ Three layers, because each catches what the others cannot:
 | | what it can see |
 |---|---|
 | `test/buffer_test.mere` | the piece table, run against **both** an in-memory origin and a real file — the pure one is the oracle for the one that ships |
+| `test/lines_test.mere` | the line index, which is **lazy**: the seam where one page's scan meets the next, and what a truncation at an edit keeps. Neither is visible to the pty suite, whose files all fit in the first page |
 | `test/search_test.mere` | a match that straddles a 256 KiB window boundary, a needle longer than a window, and backward search returning the **last** match rather than the first |
 | `test/lsp_test.mere` | the cases a working server never sends: a reply to a question the user moved on from, an `error` instead of a `result`, a frame split across two reads, and a server *request* whose id collides with ours |
 | `test/pty_drive.py` | a **real pty**: `tty_raw` is a no-op off-tty, `term_rows` answers -1 through a pipe, and IXON/ISIG only exist where there is a line discipline. Piped tests passed while Ctrl-Z did nothing at all |
+| `bench/latency.py` | the gap between a keystroke and the screen changing, on a real pty. Everything above measures a part; this measures what a person waits for |
 | the same suite with `mere` on `PATH` | the language server end to end — a diagnostic arriving and clearing, hover, definition, completion, formatting, and the two encoding cases: **kanji** separates bytes from characters, and an **emoji** separates characters from UTF-16 units. Neither substitutes for the other |
 
 The pty suite waits for the thing it is about to assert on rather than for a

@@ -69,13 +69,14 @@ def visible(raw: bytes) -> str:
 
 
 class Session:
-    def __init__(self, argv, env=None):
+    def __init__(self, argv, env=None, amb_cols=1):
         """`env` overrides variables in the CHILD only.
 
         The config tests need a `$HOME` with a `.medit2.toml` in it, and
         writing one into the real home directory would be a test that edits
         the machine it runs on.
         """
+        self.amb_cols = amb_cols
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             if env:
@@ -86,6 +87,25 @@ class Session:
         self.raw = b""
         self.dead = False
         self.drain(1.5)
+
+
+    # The editor asks the terminal how wide an ambiguous-width character was
+    # drawn (`ESC[6n`) and waits up to 120 ms for the answer. A harness that
+    # stays silent makes every startup pay that wait AND leaves the reply
+    # parser -- which decides whether Japanese punctuation is one column or
+    # two -- with no test at all.
+    #
+    # `amb_cols` is what this pretend terminal claims: 1 for a Western
+    # terminal, 2 for one configured for CJK. The cursor lands one past the
+    # character it drew.
+    def _answer_cpr(self, chunk):
+        if b"\x1b[6n" not in chunk:
+            return
+        for _ in range(chunk.count(b"\x1b[6n")):
+            try:
+                os.write(self.fd, b"\x1b[1;%dR" % (1 + self.amb_cols))
+            except OSError:
+                return
 
     def drain(self, seconds=0.2, quiet=0.08):
         """Read until the editor stops drawing, or `seconds` elapse.
@@ -117,6 +137,7 @@ class Session:
                 # seconds, which is the slow half of "a gate must not hang".
                 self.dead = True
                 break
+            self._answer_cpr(chunk)
             self.raw += chunk
             last = time.time()
         return self.raw
@@ -627,6 +648,86 @@ def scenario_buffer_close(binary):
 
     s.send(CTRL_Q)
     s.close()
+
+
+def scenario_lazy_index(binary):
+    """A file larger than one index page, where the index is genuinely partial.
+
+    Every other scenario here uses a file that fits in the first 256 KiB page,
+    so the index is complete before the first frame and the lazy path never
+    runs. This one is four pages: at the moment it opens, the editor knows
+    where SOME of the lines are and says so.
+    """
+    path = "/tmp/medit2_lazy.txt"
+    # 1 MB of numbered lines, so a line's text says which line it is and a
+    # wrong jump is visible rather than plausible.
+    with open(path, "w") as f:
+        for i in range(1, 25001):
+            f.write("line %06d %s\n" % (i, "." * 30))
+
+    s = Session([binary, path])
+    s.wait_for("line 000001", timeout=8.0)
+
+    # The count is partial and SAYS it is partial. A number without the marker
+    # would be a claim the editor cannot support yet.
+    scr = s.screen()
+    check("the line count is marked incomplete", "+" in scr.splitlines()[-1], True)
+
+    # Jumping past what is indexed has to extend the index to get there.
+    s.send(CTRL_G)
+    s.send(b"20000")
+    s.send(ENTER)
+    check("a jump past the indexed prefix lands", s.wait_for("line 020000", timeout=8.0), True)
+
+    # Jumping past the END clamps, which needs the whole file -- after that the
+    # count is exact and the marker is gone.
+    s.send(CTRL_G)
+    s.send(b"999999")
+    s.send(ENTER)
+    check("a jump past the end lands on the last line",
+          s.wait_for("L25001/25001", timeout=10.0), True)
+    check("and the count is no longer marked partial",
+          "25001+" in s.screen(), False)
+
+    # And editing still works after all that.
+    s.send(CTRL_G)
+    s.send(b"2")
+    s.send(ENTER)
+    s.wait_for("L2/", timeout=4.0)
+    s.send(b"Z")
+    s.send(CTRL_S)
+    s.send(CTRL_Q)
+    s.close()
+
+    with open(path) as f:
+        second = f.read().split("\n")[1]
+    check("the edit landed on line 2", second.startswith("Zline 000002"), True)
+
+
+def scenario_ambiguous_width_probe(binary):
+    """The editor asks the terminal how wide `±` is, and believes the answer.
+
+    This could not be tested before: the probe ran BEFORE `tty_raw`, so in
+    canonical mode the reply -- which has no newline in it -- was never
+    delivered, the poll always timed out, and the fallback always won. The
+    auto-detection shipped and had never detected anything. The only test that
+    can see that is one that ANSWERS, which is what `amb_cols` here does.
+    """
+    path = "/tmp/medit2_amb.txt"
+    with open(path, "w") as f:
+        f.write("\u00b1x\n")          # one ambiguous-width character, then an x
+
+    for cols, want in ((1, "C2"), (2, "C3")):
+        s = Session([binary, path], amb_cols=cols)
+        s.wait_for("L1/", timeout=8.0)
+        s.send(RIGHT)
+        # The cursor column counts COLUMNS, not characters: past one ambiguous
+        # character it is 2 on a terminal that draws it narrow and 3 on one
+        # that draws it wide.
+        check("a terminal saying %d column(s) is believed" % cols,
+              s.wait_for(want, timeout=4.0), True)
+        s.send(CTRL_Q)
+        s.close()
 
 
 def scenario_lsp(binary):
@@ -1148,6 +1249,8 @@ def main():
     scenario_invalid_utf8(binary)
     scenario_search_japanese(binary)
     scenario_emoji(binary)
+    scenario_lazy_index(binary)
+    scenario_ambiguous_width_probe(binary)
     scenario_word_movement(binary)
     scenario_redo(binary)
     scenario_config(binary)

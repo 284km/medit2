@@ -1,24 +1,49 @@
-// src/lines.mere — where the lines are, without holding the file.
+// src/lines.mere — where the lines are, without holding the file and without
+// reading all of it before you can type.
 //
-// One scan at open time, in pages, and what survives is a Vec of byte offsets:
-// `starts[i]` is where line i begins. For a 208 MB / 2.6M-line file that is a
-// 20 MB index over a file never loaded.
+// `starts[i]` is the byte offset where line i begins. For a 208 MB / 2.6M-line
+// file that is a 20 MB index over a file never loaded.
 //
-// TWO RULES THIS FILE EXISTS TO OBEY, both measured:
+// IT IS BUILT LAZILY, and that is the difference between this version and the
+// one before it. Building it up front cost, measured over a real pty:
 //
-//   1. The page is read with `file_pread_bytes`, not `file_pread`. The Vec[int]
+//   open a 1 GB file      822 ms before the first frame
+//   press Enter           730 ms, every time -- the whole index was rebuilt
+//   undo                  730 ms, every time, for the same reason
+//
+// So the index now covers a PREFIX of the document, `upto` bytes of it, and
+// grows on demand and in idle time. An edit does not rebuild it and does not
+// shift it: it TRUNCATES it at the edit point, because every start below that
+// point is still correct and every start above it is about to be wrong. What
+// was O(lines after the cursor) per keystroke is now O(log lines).
+//
+// THE INDEX IS BUILT FROM THE BUFFER, not from the origin on disk. It has to
+// be: after the first edit the document is the piece table, and an index built
+// from file offsets would be indexing a file the document no longer matches.
+//
+// TWO RULES THIS FILE STILL OBEYS, both measured:
+//
+//   1. Pages are read with `file_pread_bytes`, not `file_pread`. The Vec[int]
 //      version boxes every byte -- eight bytes per byte, built one fgetc at a
 //      time. 208 MB took 3.64 s at 10.1 MB peak RSS that way; this way it is
 //      0.36 s at 1.8 MB.
 //
 //   2. Each page is scanned INSIDE a `region` block, so the page's bytes are
-//      freed before the next one is read. The index itself is built into a Vec
-//      created OUTSIDE the block -- it is meant to outlive the scan, and ints
-//      are not region-allocated, so pushing out of the block is sound.
+//      freed before the next one is read. The Vec is created OUTSIDE the block
+//      -- it outlives the scan, and ints are not region-allocated, so pushing
+//      out of the block is sound.
 //
 // The scan is a plain byte loop. SIMD was measured and is not worth it here:
 // clang vectorises the scalar loop well enough that 335 MB of newline counting
 // takes 50 ms, which is not where the time goes.
+
+// The index, and how much of the document it describes.
+//
+// `n` is the LOGICAL length -- how many entries of `v` are live. Truncating
+// lowers `n` and leaves `v` alone: a Vec cannot shrink, and re-growing one per
+// keystroke would be worse than the rebuild this replaces. Entries past `n`
+// are stale and are overwritten in place when the index grows again.
+type lineidx = { v: Vec[R, int], n: int, upto: int };
 
 module Lines {
 
@@ -26,79 +51,114 @@ module Lines {
   // enough that the per-page region block costs nothing next to the read.
   let page_size = 262144;
 
-  // Scan one page of bytes, pushing the offset of every byte AFTER a newline.
-  // `base` is the page's offset in the file, so what lands in the index is a
-  // file offset rather than a page offset.
-  let rec _scan_page = fn (starts: Vec[R, int]) -> fn (b: bytes) ->
-                       fn (i: int) -> fn (n: int) -> fn (base: int) ->
-    if i >= n then ()
-    else
-      let _ = if bytes_get b i == 10 then vec_push starts (base + i + 1) else () in
-      _scan_page starts b (i + 1) n base;
+  // A fresh index over an empty prefix. Line 0 starts at 0 always, even for an
+  // empty document -- an empty document has one (empty) line, which is what a
+  // cursor needs.
+  let fresh = fn () ->
+    let v = vec_new () in
+    let _ = vec_push v 0 in
+    (lineidx { v = v, n = 1, upto = 0 } : lineidx);
 
-  // Walk the whole origin once. `starts` is filled in order.
-  let rec _scan = fn (o: origin) -> fn (starts: Vec[R, int]) ->
-                  fn (off: int) -> fn (total: int) ->
-    if off >= total then ()
-    else
-      let want = if off + page_size > total then total - off else page_size in
-      // The page lives and dies inside this block; only ints leave it.
-      let _ = region P {
-        let s = Buffer.origin_slice o off want in
-        let b = bytes_of_str s in
-        _scan_page starts b 0 (bytes_len b) off
-      } in
-      _scan o starts (off + want) total;
+  let count = fn (ix: lineidx) -> ix.n;
 
-  // The index for an origin. Line 0 starts at 0 always, even for an empty file
-  // -- an empty document has one (empty) line, which is what a cursor needs.
-  let index_of = fn (o: origin) ->
-    let starts = vec_new () in
-    let _ = vec_push starts 0 in
-    let total = Buffer.origin_len o in
-    let _ = _scan o starts 0 total in
-    starts;
+  let covered = fn (ix: lineidx) -> ix.upto;
 
-  let count = fn (starts: Vec[R, int]) -> vec_len starts;
+  let complete = fn (ix: lineidx) -> fn (total: int) -> ix.upto >= total;
 
-  let start_of = fn (starts: Vec[R, int]) -> fn (line: int) ->
-    let n = vec_len starts in
+  // Write entry `i`, reusing a stale slot when truncation left one. A Vec
+  // cannot shrink, so truncation only lowers the logical length and the slots
+  // above it are written over next time the index grows.
+  let _put = fn (v: Vec[R, int]) -> fn (i: int) -> fn (off: int) ->
+    let _ = if i < vec_len v then vec_set v i off else vec_push v off in
+    ();
+
+  let start_of = fn (ix: lineidx) -> fn (line: int) ->
     if line <= 0 then 0
-    else if line >= n then vec_get starts (n - 1)
-    else vec_get starts line;
+    else if line >= ix.n then vec_get ix.v (ix.n - 1)
+    else vec_get ix.v line;
 
   // Where line `line` ends, exclusive of its newline: the next line's start
-  // minus one, or the end of the document for the last line.
-  let end_of = fn (starts: Vec[R, int]) -> fn (line: int) -> fn (total: int) ->
-    let n = vec_len starts in
-    if line + 1 >= n then total
+  // minus one, or the end of the document for the last KNOWN line.
+  let end_of = fn (ix: lineidx) -> fn (line: int) -> fn (total: int) ->
+    if line + 1 >= ix.n then total
     else
-      let nxt = vec_get starts (line + 1) in
+      let nxt = vec_get ix.v (line + 1) in
       if nxt > 0 then nxt - 1 else 0;
-
-  // Every start after an edit moves by the same amount. This is the whole
-  // reason the index is not rebuilt per keystroke -- rebuilding a 2.6M-line
-  // index costs 0.4 s and this costs a walk of the tail.
-  //
-  // It lives here rather than in the editor because it is an operation ON THE
-  // INDEX, and because a benchmark that measured its own copy of the loop
-  // would be measuring the copy.
-  //
-  // O(lines after the cursor), which is the cost this design trades the
-  // rebuild for: an edit on line 1 of a file with N lines writes N ints.
-  let rec shift_from = fn (v: Vec[R, int]) -> fn (i: int) -> fn (n: int) -> fn (d: int) ->
-    if i >= n then () else
-    let _ = vec_set v i (vec_get v i + d) in
-    shift_from v (i + 1) n d;
 
   // Which line a byte offset falls on. Binary search, because the cursor asks
   // this on every keystroke and the index has millions of entries.
-  let line_at = fn (starts: Vec[R, int]) -> fn (off: int) ->
+  //
+  // Only meaningful for an offset the index COVERS; the caller extends first.
+  let line_at = fn (ix: lineidx) -> fn (off: int) ->
     let rec go = fn (lo: int) -> fn (hi: int) ->
       if lo >= hi then lo
       else
         let mid = (lo + hi + 1) / 2 in
-        if vec_get starts mid <= off then go mid hi else go lo (mid - 1)
+        if vec_get ix.v mid <= off then go mid hi else go lo (mid - 1)
     in
-    if off <= 0 then 0 else go 0 (vec_len starts - 1);
+    if off <= 0 then 0 else go 0 (ix.n - 1);
+
+  // --- growing ---------------------------------------------------------------
+
+  // Scan one page of bytes, appending the offset of every byte AFTER a newline.
+  // `base` is the page's offset in the document.
+  // `at` is the next free slot; the return is how many were written. Takes the
+  // Vec rather than the index so the hot loop allocates nothing.
+  let rec _scan_page = fn (v: Vec[R, int]) -> fn (at: int) -> fn (b: bytes) ->
+                       fn (i: int) -> fn (n: int) -> fn (base: int) ->
+                       fn (added: int) ->
+    if i >= n then added
+    else if bytes_get b i == 10 then
+      let _ = _put v (at + added) (base + i + 1) in
+      _scan_page v at b (i + 1) n base (added + 1)
+    else _scan_page v at b (i + 1) n base added;
+
+  // Extend the index to cover `want` bytes of the document (clamped to
+  // `total`). A later extension resumes at exactly `upto`, so a partial read
+  // never leaves a gap.
+  let rec extend = fn (bf: buf) -> fn (ix: lineidx) -> fn (total: int) ->
+                   fn (want: int) ->
+    if ix.upto >= total || ix.upto >= want then ix
+    else
+      let off = ix.upto in
+      let room = if off + page_size > total then total - off else page_size in
+      // The page lives and dies inside this block; only ints leave it.
+      let added = region P {
+        let s = Buffer.slice bf off room in
+        let b = bytes_of_str s in
+        _scan_page ix.v ix.n b 0 (bytes_len b) off 0
+      } in
+      extend bf ({ ix | n = ix.n + added, upto = off + room } : lineidx) total want;
+
+  // Cover the whole document. What a goto-line past the end, or an exact line
+  // count, has to pay for.
+  let extend_all = fn (bf: buf) -> fn (ix: lineidx) -> fn (total: int) ->
+    extend bf ix total total;
+
+  // Extend until the index knows line `line`, or until it has read everything.
+  let rec extend_to_line = fn (bf: buf) -> fn (ix: lineidx) -> fn (total: int) ->
+                           fn (line: int) ->
+    if ix.n > line || ix.upto >= total then ix
+    else extend_to_line bf (extend bf ix total (ix.upto + page_size)) total line;
+
+  // --- an edit ---------------------------------------------------------------
+
+  // Forget everything the index knows above `at`. Every start at or below it
+  // survives an edit made at `at`: text inserted there pushes what follows
+  // down, and a line that BEGINS at `at` still begins there.
+  //
+  // This is what replaces the shift. Shifting every later start was O(lines
+  // after the cursor) -- 7 ms at 12.8M lines, 116 ms at 128M -- and rebuilding
+  // after a newline was O(the file).
+  let truncate = fn (ix: lineidx) -> fn (at: int) ->
+    if at >= ix.upto then ix
+    else
+      // The last line that starts at or below `at`, so `n` becomes its index
+      // plus one.
+      // `line_at` answers the largest index whose start is at or below `at`,
+      // which is exactly the last line to keep. Resuming the scan at that
+      // line's start re-reads one line and re-finds the newline that ends it,
+      // so nothing is missed.
+      let keep = line_at ix at in
+      ({ ix | n = keep + 1, upto = start_of ix keep } : lineidx);
 }

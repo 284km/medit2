@@ -1,0 +1,175 @@
+// test/lines_test.mere — the line index, including the part of it that only
+// exists because the index is LAZY.
+//
+// Run: mere test/lines_test.mere
+//
+// The index covers a prefix of the document and grows on demand. That makes
+// three things testable that a built-all-at-once index had no way to get
+// wrong, and one thing that it got wrong expensively:
+//
+//   - a PARTIAL index still answers correctly about the part it covers, and
+//     says how far that is
+//   - extending twice lands in the same place as extending once, with no line
+//     dropped at the seam
+//   - truncating at an edit keeps every start below it and forgets every start
+//     above it
+//   - an edit no longer costs O(lines after the cursor): `truncate` is the
+//     whole of the work, and that is what the editor calls
+
+import "../src/buffer.mere";
+import "../src/lines.mere";
+
+let fails = vec_new ();
+
+let check = fn (name: str) -> fn (got: int) -> fn (want: int) ->
+  if got == want then ()
+  else vec_push fails (name ++ ": got " ++ show got ++ " want " ++ show want);
+
+let check_b = fn (name: str) -> fn (got: bool) -> fn (want: bool) ->
+  if got == want then ()
+  else vec_push fails (name ++ ": got " ++ (if got then "true" else "false"));
+
+// --- a small document, in memory -------------------------------------------
+// "one\ntwo\nthree\nfour\n" -- starts at 0, 4, 8, 14, and an empty last line
+// at 19.
+let t = "one\ntwo\nthree\nfour\n";
+let b = Buffer.of_str t;
+let n = str_len t;
+
+let empty = Lines.fresh ();
+let _ = check "a fresh index knows one line" (Lines.count empty) 1;
+let _ = check "and covers nothing" (Lines.covered empty) 0;
+let _ = check_b "and is not complete over a document" (Lines.complete empty n) false;
+let _ = check_b "but is complete over an empty one" (Lines.complete empty 0) true;
+
+let full = Lines.extend_all b empty n;
+let _ = check "the whole document has five line starts" (Lines.count full) 5;
+let _ = check "start 0" (Lines.start_of full 0) 0;
+let _ = check "start 1" (Lines.start_of full 1) 4;
+let _ = check "start 2" (Lines.start_of full 2) 8;
+let _ = check "start 3" (Lines.start_of full 3) 14;
+let _ = check "start 4, the empty last line" (Lines.start_of full 4) 19;
+let _ = check_b "and it is complete" (Lines.complete full n) true;
+
+let _ = check "end_of line 0 stops before the newline" (Lines.end_of full 0 n) 3;
+let _ = check "end_of the last line is the end" (Lines.end_of full 4 n) n;
+
+let _ = check "line_at the start of a line" (Lines.line_at full 8) 2;
+let _ = check "line_at inside a line" (Lines.line_at full 10) 2;
+let _ = check "line_at the last byte of a line" (Lines.line_at full 13) 2;
+let _ = check "line_at 0" (Lines.line_at full 0) 0;
+
+// --- a PARTIAL index --------------------------------------------------------
+// Extending by one byte still reads a whole page, so on a document this small
+// one extension covers everything. The partial cases below are built by
+// extending a file that is larger than a page, further down.
+let part = Lines.extend b empty n 1;
+let _ = check "extending past the end covers the end" (Lines.covered part) n;
+
+// --- truncation -------------------------------------------------------------
+// Truncating keeps every line that STARTS at or below the point, because an
+// edit there leaves those starts where they are.
+let cut = Lines.truncate full 8;
+let _ = check "truncating at a line start keeps that line" (Lines.count cut) 3;
+let _ = check "and resumes from it" (Lines.covered cut) 8;
+let _ = check "the kept starts are unchanged" (Lines.start_of cut 2) 8;
+
+let cut2 = Lines.truncate full 10;
+let _ = check "truncating mid-line keeps the line it is in" (Lines.count cut2) 3;
+let _ = check "and resumes at that line's start" (Lines.covered cut2) 8;
+
+let cut0 = Lines.truncate full 0;
+let _ = check "truncating at 0 leaves line 0 alone" (Lines.count cut0) 1;
+let _ = check "and covers nothing" (Lines.covered cut0) 0;
+
+// Truncating above what is covered changes nothing: there is nothing up there
+// to forget.
+let cutfar = Lines.truncate part 999999;
+let _ = check "truncating past the covered prefix is a no-op"
+          (Lines.count cutfar) (Lines.count part);
+
+// Re-extending after a truncation has to land where it started.
+let again = Lines.extend_all b cut n;
+let _ = check "re-extending finds the same lines" (Lines.count again) 5;
+let _ = check "and the same starts" (Lines.start_of again 3) 14;
+let _ = check "and the same end" (Lines.covered again) n;
+
+// --- truncate, EDIT, extend -------------------------------------------------
+// The sequence the editor actually performs, and the only one that can see
+// whether a stale slot is reused or appended past. Re-extending an UNEDITED
+// document re-derives exactly the values the stale slots already hold, so it
+// passes either way -- the starts have to MOVE for the difference to show.
+let edited = Buffer.insert b 4 "XY";          // "one\nXYtwo\nthree\nfour\n"
+let en = n + 2;
+let re = Lines.extend_all edited (Lines.truncate full 4) en;
+let _ = check "after an edit the count is still right" (Lines.count re) 5;
+let _ = check "the start below the edit is unchanged" (Lines.start_of re 1) 4;
+let _ = check "the one above it has MOVED" (Lines.start_of re 2) 10;
+let _ = check "and so has the next" (Lines.start_of re 3) 16;
+let _ = check "and the last" (Lines.start_of re 4) 21;
+let _ = check "line_at follows the new starts" (Lines.line_at re 10) 2;
+let _ = check_b "and it is complete" (Lines.complete re en) true;
+
+// A deletion moves them the other way.
+let shrunk = Buffer.delete b 0 4;             // "two\nthree\nfour\n"
+let sn = n - 4;
+let rs = Lines.extend_all shrunk (Lines.truncate full 0) sn;
+let _ = check "after a deletion the count drops" (Lines.count rs) 4;
+let _ = check "and the starts move down" (Lines.start_of rs 1) 4;
+let _ = check "all of them" (Lines.start_of rs 2) 10;
+
+// --- across a page boundary -------------------------------------------------
+// The seam is where a lazy index can lose a line: a newline at the last byte
+// of a page belongs to the NEXT page's first line, and a scan that resumes one
+// byte late never records it.
+let page = Lines.page_size;
+let rec fill = fn (sb: StrBuf[R]) -> fn (i: int) -> fn (upto: int) ->
+  if i >= upto then () else let _ = strbuf_push sb "x" in fill sb (i + 1) upto;
+
+let bigpath = "/tmp/medit2_lines_seam.bin";
+let _ =
+  let sb = strbuf_new () in
+  // A newline exactly at the last byte of page 0, and another well inside
+  // page 1, so both sides of the seam are checked.
+  let _ = fill sb 0 (page - 1) in
+  let _ = strbuf_push sb "\n" in
+  let _ = fill sb 0 100 in
+  let _ = strbuf_push sb "\n" in
+  let _ = fill sb 0 100 in
+  write_file bigpath (strbuf_to_str sb);
+
+let bsz = file_size bigpath;
+let bf = file_openrw bigpath;
+let bb = Buffer.of_origin (Disk ((bf, bsz)));
+
+let one = Lines.extend bb (Lines.fresh ()) bsz 1;
+let _ = check "one page covers one page" (Lines.covered one) page;
+let _ = check "and finds the newline at its last byte" (Lines.count one) 2;
+let _ = check "whose next line starts just after it" (Lines.start_of one 1) page;
+let _ = check_b "and is not complete" (Lines.complete one bsz) false;
+
+let two = Lines.extend_all bb one bsz;
+let _ = check "the rest adds the second newline" (Lines.count two) 3;
+let _ = check "at the right offset" (Lines.start_of two 2) (page + 101);
+let _ = check_b "and now it is complete" (Lines.complete two bsz) true;
+
+// The same index built in ONE go must agree with the one built in two.
+let once = Lines.extend_all bb (Lines.fresh ()) bsz;
+let _ = check "one pass and two passes agree on the count"
+          (Lines.count once) (Lines.count two);
+let _ = check "and on the seam" (Lines.start_of once 1) (Lines.start_of two 1);
+let _ = check "and on what follows it" (Lines.start_of once 2) (Lines.start_of two 2);
+
+// extend_to_line stops as soon as it knows the line asked for.
+let upto1 = Lines.extend_to_line bb (Lines.fresh ()) bsz 1;
+let _ = check "extend_to_line reads only as far as it must" (Lines.covered upto1) page;
+let _ = check_b "and knows the line" (Lines.count upto1 > 1) true;
+
+let _ = file_close bf;
+
+// --- report ----------------------------------------------------------------
+let nf = vec_len fails;
+let rec report = fn (i: int) ->
+  if i >= nf then () else let _ = print ("FAIL " ++ vec_get fails i) in report (i + 1);
+let _ = report 0;
+print (if nf == 0 then "lines: all ok" else "lines: " ++ show nf ++ " FAILED")

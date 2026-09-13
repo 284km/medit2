@@ -50,20 +50,28 @@ match _first_path argv with
     let o = Disk ((f, sz)) in
 
     // --- open ---------------------------------------------------------------
-    // The piece table itself is one piece and costs nothing; the line index is
-    // the whole of the open cost, and it is a full pass over the file.
+    // The piece table is one piece and costs nothing. The index is LAZY, so
+    // what opening costs is one page of it -- enough to draw a screen. The
+    // whole index is measured separately below, because it is what a line
+    // count or a jump to the end pays for and nothing else does.
     let t0 = now_ms () in
     let b = Buffer.of_origin o in
-    let idx = Lines.index_of o in
+    let opened = Lines.extend_to_line b (Lines.fresh ()) sz 24 in
     let t1 = now_ms () in
+    let _ = print ("open " ++ show (t1 - t0) ++ " ms") in
+    let _ = print ("open_lines " ++ show (Lines.count opened)) in
+
+    let t0b = now_ms () in
+    let idx = Lines.extend_all b opened sz in
+    let t1b = now_ms () in
     let nlines = Lines.count idx in
     let index_bytes = nlines * 8 in
 
     let _ = print ("bytes " ++ show sz ++ " B") in
     let _ = print ("lines " ++ show nlines) in
     let _ = print ("pieces " ++ show (Buffer.piece_count b)) in
-    let _ = print ("open " ++ show (t1 - t0) ++ " ms") in
-    let _ = print ("open_rate " ++ show (_mbps sz (t1 - t0)) ++ " MB/s") in
+    let _ = print ("index_all " ++ show (t1b - t0b) ++ " ms") in
+    let _ = print ("index_rate " ++ show (_mbps sz (t1b - t0b)) ++ " MB/s") in
     let _ = print ("index " ++ show index_bytes ++ " B") in
     // The ratio is the number that decides whether a sparse index is needed:
     // 8 bytes per line against the bytes per line the file actually has.
@@ -81,17 +89,16 @@ match _first_path argv with
     let _ = print ("scan_rate " ++ show (_mbps sz (t3 - t2)) ++ " MB/s") in
     let _ = print ("scan_found " ++ show hit) in
 
-    // --- shift --------------------------------------------------------------
-    // One inserted byte at offset 0. Every line start after it moves, which is
-    // all of them -- the worst case, and the one an editor hits whenever
-    // somebody types at the top of a file.
+    // --- an edit at the top --------------------------------------------------
+    // What an edit costs the index. It used to be a shift of every start after
+    // the cursor -- 7 ms at 12.8M lines, 116 ms at 128M -- and a full rebuild
+    // when the edit was a newline. It is now a truncation: O(log lines), and
+    // the same for a newline as for a letter.
     let t4 = now_ms () in
-    let _ = Lines.shift_from idx 1 nlines 1 in
+    let cut = Lines.truncate idx 0 in
     let t5 = now_ms () in
-    let _ = print ("shift " ++ show (t5 - t4) ++ " ms") in
-    // Put it back, so a second run of this program on the same index would
-    // measure the same thing.
-    let _ = Lines.shift_from idx 1 nlines (0 - 1) in
+    let _ = print ("edit_index " ++ show (t5 - t4) ++ " ms") in
+    let _ = print ("edit_kept " ++ show (Lines.count cut) ++ " lines") in
 
     // --- a rebuild, for comparison ------------------------------------------
     // What the editor does NOT do per keystroke. Printed beside the shift so
@@ -111,7 +118,7 @@ match _first_path argv with
     let _ = if not (_has argv "--rebuild") then ()
             else
               let t6 = now_ms () in
-              let _ = Lines.index_of o in
+              let _ = Lines.extend_all b (Lines.fresh ()) sz in
               let t7 = now_ms () in
               print ("rebuild " ++ show (t7 - t6) ++ " ms") in
 
