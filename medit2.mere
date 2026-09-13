@@ -182,11 +182,6 @@ let esc = chr 27;
 // start after it by a fixed delta and adds or removes the ones inside it, which
 // is a walk of the tail.
 
-let rec _shift_from = fn (v: Vec[R, int]) -> fn (i: int) -> fn (n: int) -> fn (d: int) ->
-  if i >= n then () else
-  let _ = vec_set v i (vec_get v i + d) in
-  _shift_from v (i + 1) n d;
-
 // Rebuild the index from the buffer. Correct but O(document); used at open and
 // after an undo, where the delta is not known.
 let reindex = fn (st: ed) ->
@@ -389,7 +384,7 @@ let do_insert = fn (st: ed) -> fn (s: str) ->
   let n = str_len s in
   let l = Lines.line_at st.starts st.cur in
   // Shift every later start, then insert a start for each newline typed.
-  let _ = _shift_from st.starts (l + 1) (vec_len st.starts) n in
+  let _ = Lines.shift_from st.starts (l + 1) (vec_len st.starts) n in
   let st = ({ st | buf = b, total = st.total + n } : ed) in
   // A newline changes the line structure; rebuilding is rare enough to afford.
   let st = if str_contains s (chr 10) then reindex st else st in
@@ -409,7 +404,7 @@ let do_delete_back = fn (st: ed) ->
     let st = if str_contains removed (chr 10) then reindex st
              else
                let l = Lines.line_at st.starts st.cur in
-               let _ = _shift_from st.starts (l + 1) (vec_len st.starts) (0 - n) in
+               let _ = Lines.shift_from st.starts (l + 1) (vec_len st.starts) (0 - n) in
                st in
     move_to st from;
 

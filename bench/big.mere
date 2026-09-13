@@ -1,0 +1,118 @@
+// bench/big.mere — what this design actually costs at a given file size.
+//
+// The editor claims to open a file it cannot hold. That claim was measured at
+// 208 MB; this measures the same four things at whatever size you hand it, so
+// the claim can be re-checked rather than extrapolated.
+//
+//   open    building the line index (one pass over the file)
+//   index   how much memory that index is, against the file it describes
+//   scan    a literal search that finds nothing, so the whole file is read
+//   shift   one edit's effect on the index -- at the FRONT of the file, which
+//           is the worst case: every start after the cursor moves
+//
+// Run:  sh bench/big.sh            (builds the files and runs this)
+//       ./bench_big FILE           (one file you already have)
+//
+// The numbers are printed one per line as `name value unit`, so a shell can
+// read them without parsing prose.
+
+import "../src/buffer.mere";
+import "../src/lines.mere";
+import "../src/search.mere";
+
+// A monotonic millisecond clock. Timing inside the program rather than around
+// it, because `time ./bench` would include building the 1 GB file's page cache
+// and the process's own startup.
+extern fn now_ms: unit -> int;
+
+let argv = args ();
+
+let rec _first_path = fn (xs: str list) ->
+  match xs with
+  | Nil -> ""
+  | Cons (x, rest) -> if str_starts_with x "--" then _first_path rest else x;
+
+// Integer permille, so a ratio can be printed without floats.
+let _permille = fn (num: int) -> fn (den: int) ->
+  if den <= 0 then 0 else num * 1000 / den;
+
+// MB/s from bytes and milliseconds, without overflowing and without floats.
+let _mbps = fn (bytes: int) -> fn (ms: int) ->
+  if ms <= 0 then 0 else (bytes / 1000) / ms;
+
+match _first_path argv with
+| "" -> print "usage: bench_big FILE"
+| path ->
+  if not (file_exists path) then print ("no such file: " ++ path)
+  else
+    let sz = file_size path in
+    let f = file_openrw path in
+    let o = Disk ((f, sz)) in
+
+    // --- open ---------------------------------------------------------------
+    // The piece table itself is one piece and costs nothing; the line index is
+    // the whole of the open cost, and it is a full pass over the file.
+    let t0 = now_ms () in
+    let b = Buffer.of_origin o in
+    let idx = Lines.index_of o in
+    let t1 = now_ms () in
+    let nlines = Lines.count idx in
+    let index_bytes = nlines * 8 in
+
+    let _ = print ("bytes " ++ show sz ++ " B") in
+    let _ = print ("lines " ++ show nlines) in
+    let _ = print ("pieces " ++ show (Buffer.piece_count b)) in
+    let _ = print ("open " ++ show (t1 - t0) ++ " ms") in
+    let _ = print ("open_rate " ++ show (_mbps sz (t1 - t0)) ++ " MB/s") in
+    let _ = print ("index " ++ show index_bytes ++ " B") in
+    // The ratio is the number that decides whether a sparse index is needed:
+    // 8 bytes per line against the bytes per line the file actually has.
+    let _ = print ("index_permille " ++ show (_permille index_bytes sz) ++ " of the file") in
+    let _ = print ("bytes_per_line " ++ show (if nlines > 0 then sz / nlines else 0)) in
+
+    // --- scan ---------------------------------------------------------------
+    // A needle that is NOT in the file, so the search cannot stop early and the
+    // number is the whole-file rate rather than "how far in the first hit was".
+    let needle = "zzq" ++ "-no-such-needle-" ++ "zzq" in
+    let t2 = now_ms () in
+    let hit = Search.forward b sz 0 needle in
+    let t3 = now_ms () in
+    let _ = print ("scan " ++ show (t3 - t2) ++ " ms") in
+    let _ = print ("scan_rate " ++ show (_mbps sz (t3 - t2)) ++ " MB/s") in
+    let _ = print ("scan_found " ++ show hit) in
+
+    // --- shift --------------------------------------------------------------
+    // One inserted byte at offset 0. Every line start after it moves, which is
+    // all of them -- the worst case, and the one an editor hits whenever
+    // somebody types at the top of a file.
+    let t4 = now_ms () in
+    let _ = Lines.shift_from idx 1 nlines 1 in
+    let t5 = now_ms () in
+    let _ = print ("shift " ++ show (t5 - t4) ++ " ms") in
+    // Put it back, so a second run of this program on the same index would
+    // measure the same thing.
+    let _ = Lines.shift_from idx 1 nlines (0 - 1) in
+
+    // --- a rebuild, for comparison ------------------------------------------
+    // What the editor does NOT do per keystroke. Printed beside the shift so
+    // the trade is visible rather than asserted.
+    //
+    // OFF BY DEFAULT, because it builds a SECOND index while the first is
+    // still alive and the run's peak RSS then reports two of them. Measured at
+    // 1 GB of 8-byte lines that read as 2.0 GB against a 1.02 GB index, and
+    // "the editor uses twice the memory of its own index" is a conclusion
+    // about this benchmark rather than about the editor. A large Vec here
+    // costs 1.00-1.04x what its elements need; the doubling is realloc'd in
+    // place on a dedicated block, not stranded.
+    let rec _has = fn (xs: str list) -> fn (w: str) ->
+      match xs with
+      | Nil -> false
+      | Cons (x, r) -> if str_eq x w then true else _has r w in
+    let _ = if not (_has argv "--rebuild") then ()
+            else
+              let t6 = now_ms () in
+              let _ = Lines.index_of o in
+              let t7 = now_ms () in
+              print ("rebuild " ++ show (t7 - t6) ++ " ms") in
+
+    file_close f

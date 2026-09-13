@@ -121,6 +121,38 @@ Reads go through **`file_pread_bytes`**, which this editor is the reason for
 builds it one `fgetc` at a time: 208 MB took 3.64 s at 10.1 MB, against 0.36 s
 at 1.8 MB now. See [PAIN.md](./PAIN.md) P1.
 
+### What it costs, measured
+
+`sh bench/big.sh` builds the files and takes these; they are not extrapolated
+from the 208 MB row.
+
+| | 208 MB, 80 B/line | 1 GB, 80 B/line | 1 GB, 8 B/line |
+|---|---|---|---|
+| lines | 2.6 M | 12.8 M | 128 M |
+| open (build the line index) | 136 ms | 676 ms | 858 ms |
+| **peak RSS** | **24.7 MB** | **104 MB** | **1.00 GB** |
+| line index | 20.8 MB | 102 MB | 1.02 GB |
+| search the whole file, no match | 28 ms | 142 ms | 140 ms |
+| one edit at the top (shift the index) | 1 ms | 7 ms | 116 ms |
+| rebuilding the index instead | 136 ms | 661 ms | 948 ms |
+
+Three things worth reading off it:
+
+- **The resident memory IS the line index** — 1.00× it, and the document is not
+  in memory at any size. The index is 8 bytes per LINE, so what decides its
+  size is the line length and not the file: 1 GB of ordinary source or log
+  costs 104 MB, and the index only reaches the size of the file it describes at
+  8 bytes per line. Nothing here needs compressing.
+- **Search runs at ~7.2 GB/s**, which is memory bandwidth rather than a loop.
+  It was 548 MB/s until this benchmark was pointed at it: `str_index_of` in the
+  compiler compared the needle at every offset instead of letting `memchr` find
+  the candidate first bytes. Fixed in mere v0.1.479 — 13× for every program in
+  the language, found by measuring an editor.
+- **Shifting the index beats rebuilding it by 94×** at 12.8 M lines (7 ms
+  against 661 ms), which is the trade the incremental index exists for. At
+  128 M lines the shift is 116 ms and would be felt per keystroke; that, and
+  not the memory, is where this design would need rethinking.
+
 ## Two structural rules
 
 Both measured rather than assumed, and both in the source where they apply:

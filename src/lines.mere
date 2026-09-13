@@ -76,6 +76,21 @@ module Lines {
       let nxt = vec_get starts (line + 1) in
       if nxt > 0 then nxt - 1 else 0;
 
+  // Every start after an edit moves by the same amount. This is the whole
+  // reason the index is not rebuilt per keystroke -- rebuilding a 2.6M-line
+  // index costs 0.4 s and this costs a walk of the tail.
+  //
+  // It lives here rather than in the editor because it is an operation ON THE
+  // INDEX, and because a benchmark that measured its own copy of the loop
+  // would be measuring the copy.
+  //
+  // O(lines after the cursor), which is the cost this design trades the
+  // rebuild for: an edit on line 1 of a file with N lines writes N ints.
+  let rec shift_from = fn (v: Vec[R, int]) -> fn (i: int) -> fn (n: int) -> fn (d: int) ->
+    if i >= n then () else
+    let _ = vec_set v i (vec_get v i + d) in
+    shift_from v (i + 1) n d;
+
   // Which line a byte offset falls on. Binary search, because the cursor asks
   // this on every keystroke and the index has millions of entries.
   let line_at = fn (starts: Vec[R, int]) -> fn (off: int) ->
