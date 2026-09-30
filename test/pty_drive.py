@@ -823,8 +823,13 @@ def scenario_lsp(binary):
     # the message is malformed however lenient the parser is. Without this
     # character the scenario passes with the escaping deleted, which is a test
     # that tests nothing.
+    #
+    # Line 3 reads `y` as well as `greet`: once fixed, the file must have NO
+    # diagnostic at all, and a `y` nothing reads is a warning (unused
+    # bindings, mere v0.1.503) -- the status bar then showed that instead of
+    # "lsp ok", and this check failed on an editor that was right.
     with open(path, "w") as f:
-        f.write('let greet = "hi" in\nlet y = 1 +\nprint greet\n')
+        f.write('let greet = "hi" in\nlet y = 1 +\nprint (greet ++ str_of_int y)\n')
 
     s = Session([binary, path])
 
